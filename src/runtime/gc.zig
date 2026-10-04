@@ -236,6 +236,9 @@ pub const Marker = struct {
         self.stats.attr_pos += n;
         self.stats.bytes += n * @sizeOf(heap_mod.AttrPosEntry);
     }
+    pub inline fn stringBytes(self: *Marker, n: u64) Error!void {
+        self.stats.bytes += n;
+    }
 
     pub inline fn objectSlot(self: *Marker) Error!void {
         self.countObject();
@@ -697,6 +700,9 @@ const SerialSink = struct {
         self.tr.stats.attr_pos += n;
         self.tr.stats.bytes += n * @sizeOf(heap_mod.AttrPosEntry);
     }
+    pub inline fn stringBytes(self: *SerialSink, n: u64) Error!void {
+        self.tr.stats.bytes += n;
+    }
 
     pub inline fn objectSlot(self: *SerialSink) Error!void {
         self.countObject();
@@ -797,9 +803,10 @@ pub const Breakdown = struct {
     attr_pos_live: u64,
     attr_pos_reserved: u64,
 };
-pub fn recordTiming(state: *ReportState, mark_ns: u64, sweep_ns: u64) void {
+pub fn recordTiming(state: *ReportState, kind: CollectionKind, mark_ns: u64, sweep_ns: u64) void {
     _ = state.mark_ns_total.fetchAdd(mark_ns, .monotonic);
     _ = state.sweep_ns_total.fetchAdd(sweep_ns, .monotonic);
+    _ = state.max_pause_ns[@intFromEnum(kind)].fetchMax(mark_ns + sweep_ns, .monotonic);
 }
 
 // Mark-phase breakdown (w=1 serial path): bitmap reset / root scan /
@@ -962,7 +969,7 @@ pub fn currentRssBytes() u64 {
     return pages * std.heap.pageSize();
 }
 
-pub fn report(state: *const ReportState, budget_bytes: u64) void {
+pub fn report(state: *const ReportState, pacer: *const heap_mod.pacing.Pacer) void {
     // Diagnostic stderr during `zig build test --listen=-` corrupts the
     // runner. Stay silent under the test runner.
     if (builtin.is_test) return;
@@ -974,7 +981,16 @@ pub fn report(state: *const ReportState, budget_bytes: u64) void {
     const sweep_ns_total = state.sweep_ns_total.load(.monotonic);
     const barrier_ns_total = state.barrier_ns_total.load(.monotonic);
     const drain_ns_total = state.drain_ns_total.load(.monotonic);
-    std.debug.print("memory budget (reserved-bytes ceiling): {d:.1} MB\n", .{mb(budget_bytes)});
+    if (pacer.isDisabled()) {
+        std.debug.print("pacer: disabled (--gc-budget=0)\n", .{});
+    } else {
+        const c = pacer.config;
+        std.debug.print("pacer: arm at {d:.1} MB allocated, nursery {d}% of old in [{d:.1}, {d:.1}] MB", .{ mb(c.arm_bytes), c.growth_percent, mb(c.min_nursery), mb(c.max_nursery) });
+        if (c.limit_bytes) |limit| std.debug.print(", soft limit {d:.1} MB", .{mb(limit)});
+        if (c.step_bytes > 0) std.debug.print(", step {d:.1} MB", .{mb(c.step_bytes)});
+        std.debug.print("\n", .{});
+        std.debug.print("pacer state: old {d:.1} MB, major base {d:.1} MB\n", .{ mb(pacer.old_bytes), mb(pacer.major_base) });
+    }
     std.debug.print("collections: {d} ({d} minor, {d} major)\n", .{
         live.collections,
         state.minor_collections.load(.monotonic),
@@ -994,6 +1010,10 @@ pub fn report(state: *const ReportState, budget_bytes: u64) void {
             @as(f64, @floatFromInt(drain_ns_total)) / 1e6,
         });
     std.debug.print("sweep time (total): {d:.1} ms\n", .{@as(f64, @floatFromInt(sweep_ns_total)) / 1e6});
+    std.debug.print("max pause (minor / major): {d:.1} / {d:.1} ms\n", .{
+        @as(f64, @floatFromInt(state.max_pause_ns[0].load(.monotonic))) / 1e6,
+        @as(f64, @floatFromInt(state.max_pause_ns[1].load(.monotonic))) / 1e6,
+    });
     std.debug.print("barrier wait (total, w>1 spin): {d:.1} ms\n", .{@as(f64, @floatFromInt(barrier_ns_total)) / 1e6});
     std.debug.print("peak RSS (kernel high-water): {d:.1} MB\n", .{mb(peakRssBytes())});
     std.debug.print("current RSS (end of eval): {d:.1} MB\n", .{mb(currentRssBytes())});
@@ -1017,7 +1037,7 @@ pub fn report(state: *const ReportState, budget_bytes: u64) void {
         });
     }
     if (live.collections == 0)
-        std.debug.print("(no collection — eval stayed under the threshold)\n", .{});
+        std.debug.print("(no collection — eval stayed under the arm line)\n", .{});
 }
 
 test "gc census excludes object TLAB tails discarded at arming" {
@@ -1052,7 +1072,7 @@ test "gc reclaim: sweep frees unreachable objects + ranges, allocator reuses the
     const allocator = std.testing.allocator;
     var heap = try ObjectHeap.init(allocator, 1);
     defer heap.deinit();
-    heap_collector.enableCollect(&heap, 64 << 20, 0);
+    heap_collector.configureEager(&heap, .{});
 
     // Live tree: outer list -> inner list. Garbage: two unreferenced lists.
     const inner = try heap.addList(&.{ Value.int(1), Value.int(2), Value.int(3) });
@@ -1092,7 +1112,7 @@ test "gc reclaim: heap strings survive marking; swept byte ranges poison and reu
     const allocator = std.testing.allocator;
     var heap = try ObjectHeap.init(allocator, 1);
     defer heap.deinit();
-    heap_collector.enableCollect(&heap, 64 << 20, 0);
+    heap_collector.configureEager(&heap, .{});
 
     // Equal lengths so the dead range is an exact best-fit for the reuse
     // allocation below.
@@ -1145,7 +1165,7 @@ test "concurrency: detector poisons swept thunk state so stale claims trap" {
     const allocator = std.testing.allocator;
     var heap = try ObjectHeap.init(allocator, 1);
     defer heap.deinit();
-    heap_collector.enableCollect(&heap, 64 << 20, 0);
+    heap_collector.configureEager(&heap, .{});
 
     const live_id = try heap.addThunk(thunk_mod.Thunk.init(Value.int(1)));
     const dead_id = try heap.addThunk(thunk_mod.Thunk.init(Value.int(2)));
@@ -1169,7 +1189,7 @@ test "gc range reuse splits a larger range and preserves the remainder" {
     const allocator = std.testing.allocator;
     var heap = try ObjectHeap.init(allocator, 1);
     defer heap.deinit();
-    heap_collector.enableCollect(&heap, 64 << 20, 0);
+    heap_collector.configureEager(&heap, .{});
 
     const live = try heap.addList(&.{Value.int(1)});
     const dead = try heap.addList(&.{
@@ -1243,7 +1263,7 @@ test "gc range best-fit preserves a larger class for a later request" {
     const allocator = std.testing.allocator;
     var heap = try ObjectHeap.init(allocator, 1);
     defer heap.deinit();
-    heap_collector.enableCollect(&heap, 64 << 20, 0);
+    heap_collector.configureEager(&heap, .{});
 
     const large = try heap.addList(&.{ Value.int(1), Value.int(2), Value.int(3), Value.int(4), Value.int(5), Value.int(6), Value.int(7) });
     const large_range = switch (heap.get(large).*) {
@@ -1287,7 +1307,7 @@ test "partially filled attr reservation returns its unowned tail" {
     const allocator = std.testing.allocator;
     var heap = try ObjectHeap.init(allocator, 1);
     defer heap.deinit();
-    heap_collector.enableCollect(&heap, 64 << 20, 0);
+    heap_collector.configureEager(&heap, .{});
 
     const reserved = try heap.reserveAttrsForMerge(7);
     errdefer heap.abortMergedAttrs(reserved);
@@ -1317,7 +1337,7 @@ test "range TLAB refill returns the abandoned tail" {
     const allocator = std.testing.allocator;
     var heap = try ObjectHeap.init(allocator, 1);
     defer heap.deinit();
-    heap_collector.enableCollect(&heap, 64 << 20, 0);
+    heap_collector.configureEager(&heap, .{});
 
     const first_values = try allocator.alloc(Value, 8000);
     defer allocator.free(first_values);
@@ -1349,7 +1369,7 @@ test "gc sweep coalesces consecutive adjacent dead ranges" {
     const allocator = std.testing.allocator;
     var heap = try ObjectHeap.init(allocator, 1);
     defer heap.deinit();
-    heap_collector.enableCollect(&heap, 64 << 20, 0);
+    heap_collector.configureEager(&heap, .{});
 
     const live = try heap.addList(&.{Value.int(1)});
     const dead_a = try heap.addList(&.{ Value.int(2), Value.int(3) });
@@ -1396,7 +1416,7 @@ test "major coalescing joins adjacent ranges freed by different collections" {
     const allocator = std.testing.allocator;
     var heap = try ObjectHeap.init(allocator, 2);
     defer heap.deinit();
-    heap_collector.enableCollect(&heap, 64 << 20, 0);
+    heap_collector.configureEager(&heap, .{});
 
     const saved_worker = containers.worker_id.state();
     defer containers.worker_id.set(saved_worker.id, saved_worker.is_worker);
@@ -1450,39 +1470,14 @@ test "major coalescing joins adjacent ranges freed by different collections" {
     try std.testing.expectEqual(values_before, heap.values.count());
 }
 
-test "exhausting a reclaimed object pool requests an early collection once" {
-    // The object-reuse contract this asserts is deliberately void in
-    // detector builds: swept slots are retained un-reused so stale id reads
-    // keep trapping (`sweepYoungListInto`, the `!gc_debug` reuse gate in
-    // object construction), and pool-miss arming is bypassed with them.
-    if (comptime heap_mod.gc_debug) return error.SkipZigTest;
-    const allocator = std.testing.allocator;
-    var heap = try ObjectHeap.init(allocator, 1);
-    defer heap.deinit();
-    heap_collector.enableCollect(&heap, 64 << 20, 0);
-
-    // `afterCollect` normally arms this only after a worthwhile reclaimed
-    // pool was published. Model that post-collection state, then verify that
-    // the first true pool miss requests a safepoint collection and consumes
-    // the one-shot arm.
-    heap.collection.object_miss_collect_armed.store(true, .monotonic);
-    _ = try heap.addBoxedInt(1);
-    try std.testing.expect(heap.collection.collect_requested.load(.monotonic));
-    try std.testing.expect(!heap.collection.object_miss_collect_armed.load(.monotonic));
-    try std.testing.expectEqual(@as(u64, 1), heap.collection.object_miss_collect_requests.load(.monotonic));
-
-    _ = try heap.addBoxedInt(2);
-    try std.testing.expectEqual(@as(u64, 1), heap.collection.object_miss_collect_requests.load(.monotonic));
-}
-
 test "minor sweep publishes every allocation worker's storage for reuse" {
-    // Asserts object-slot reuse — deliberately void in detector builds
-    // (see the skip note in the pool-exhaustion test above).
+    // Asserts object-slot reuse — deliberately void in detector builds:
+    // swept slots are retained un-reused so stale id reads keep trapping.
     if (comptime heap_mod.gc_debug) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var heap = try ObjectHeap.init(allocator, 2);
     defer heap.deinit();
-    heap_collector.enableCollect(&heap, 64 << 20, 0);
+    heap_collector.configureEager(&heap, .{});
 
     const saved_worker = containers.worker_id.state();
     defer containers.worker_id.set(saved_worker.id, saved_worker.is_worker);
@@ -1535,13 +1530,13 @@ test "minor sweep publishes every allocation worker's storage for reuse" {
 }
 
 test "collection boundary makes free storage available to an idle worker" {
-    // Asserts object-slot reuse — deliberately void in detector builds
-    // (see the skip note in the pool-exhaustion test above).
+    // Asserts object-slot reuse — deliberately void in detector builds:
+    // swept slots are retained un-reused so stale id reads keep trapping.
     if (comptime heap_mod.gc_debug) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var heap = try ObjectHeap.init(allocator, 2);
     defer heap.deinit();
-    heap_collector.enableCollect(&heap, 64 << 20, 0);
+    heap_collector.configureEager(&heap, .{});
 
     const saved_worker = containers.worker_id.state();
     defer containers.worker_id.set(saved_worker.id, saved_worker.is_worker);
@@ -1576,7 +1571,7 @@ test "resolved thunk returns its spilled capture range" {
     const allocator = std.testing.allocator;
     var heap = try ObjectHeap.init(allocator, 1);
     defer heap.deinit();
-    heap_collector.enableCollect(&heap, 64 << 20, 0);
+    heap_collector.configureEager(&heap, .{});
 
     const thunk_id = try heap.addBytecodeThunk(1, &.{ Value.int(1), Value.int(2), Value.int(3) });
     const thunk = try heap.getThunk(thunk_id);
@@ -1600,19 +1595,19 @@ test "constrained GC makes the first post-arm collection major" {
     const allocator = std.testing.allocator;
     var heap = try ObjectHeap.init(allocator, 1);
     defer heap.deinit();
-    heap_collector.enableBudget(&heap, 512 << 20, true);
+    heap_collector.configure(&heap, .{}, true);
 
     // This allocation precedes lazy arming, but constrained mode has kept its
     // roots precise so the first major may reclaim it if unreachable.
     _ = try heap.addList(&.{Value.int(1)});
     try std.testing.expect(!heap.gcShouldMajor());
-    heap_collector.armLazy(&heap);
+    heap_collector.arm(&heap);
     try std.testing.expect(heap.gcShouldMajor());
 
     // Major reconciliation lowers the generation boundary and returns to the
-    // ordinary promotion-count gate.
+    // pacer's growth gate.
     heap.gcMajorReconcile(&.{});
-    heap.gcNoteMajor(0);
+    heap_collector.afterCollect(&heap, .{ .major = 0 });
     try std.testing.expect(!heap.gcShouldMajor());
 }
 
@@ -1727,9 +1722,12 @@ test "tracer: parallel mark reaches exactly the live set (marker_count markers, 
 
 test "gc stat recorders accumulate observable deltas" {
     var state: ReportState = .{};
-    recordTiming(&state, 100, 50);
-    try std.testing.expectEqual(@as(u64, 100), state.mark_ns_total.load(.monotonic));
-    try std.testing.expectEqual(@as(u64, 50), state.sweep_ns_total.load(.monotonic));
+    recordTiming(&state, .minor, 100, 50);
+    recordTiming(&state, .minor, 20, 10);
+    try std.testing.expectEqual(@as(u64, 120), state.mark_ns_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 60), state.sweep_ns_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 150), state.max_pause_ns[0].load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), state.max_pause_ns[1].load(.monotonic));
 
     const breakdown: Breakdown = .{
         .obj_live = 3,
@@ -1772,15 +1770,17 @@ test "gc policy and reports are isolated per heap" {
     var right = try ObjectHeap.init(std.testing.allocator, 1);
     defer right.deinit();
 
-    heap_collector.enableCollect(&left, 128 << 20, 4 << 20);
-    heap_collector.enableBudget(&right, 2 << 30, false);
+    heap_collector.configureEager(&left, .{ .limit_bytes = 128 << 20, .step_bytes = 4 << 20 });
+    heap_collector.configure(&right, .{ .limit_bytes = 2 << 30 }, false);
     left.gcSetDisableReuse(true);
 
-    try std.testing.expectEqual(@as(u64, 128 << 20), left.collection.budget_bytes);
-    try std.testing.expectEqual(@as(u64, 4 << 20), left.collection.step_bytes);
+    try std.testing.expectEqual(@as(?u64, 128 << 20), left.collection.pacer.config.limit_bytes);
+    try std.testing.expectEqual(@as(u64, 4 << 20), left.collection.pacer.config.step_bytes);
+    try std.testing.expect(left.collection.collect_enabled);
     try std.testing.expect(left.collection.disable_reuse);
-    try std.testing.expectEqual(@as(u64, 2 << 30), right.collection.budget_bytes);
-    try std.testing.expectEqual(@as(u64, 0), right.collection.step_bytes);
+    try std.testing.expectEqual(@as(?u64, 2 << 30), right.collection.pacer.config.limit_bytes);
+    try std.testing.expectEqual(@as(u64, 0), right.collection.pacer.config.step_bytes);
+    try std.testing.expect(!right.collection.collect_enabled);
     try std.testing.expect(!right.collection.disable_reuse);
 
     recordCollection(&left.collection.report, .minor, 3, .{ .bytes = 4096 }, 8192);

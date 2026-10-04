@@ -1,28 +1,52 @@
 # GC
 
 *A non-moving, precise, generational collector. It runs at every worker count.
-Tracking starts lazily, so evaluations below the arming threshold avoid its
-barriers and free-list work.*
+Tracking starts lazily, so evaluations below the arm line avoid its barriers
+and free-list work.*
 
 Without reclamation, heap storage grows with total allocation rather than the
 live set. Collection returns unreachable storage to later allocations. Its
 measured cost belongs in [perf/model](perf/model.md).
 
-## Memory budget (the collection policy)
+## Pacing (the collection policy)
 
-One number decides when the collector runs: a threshold over heap-reserved
-bytes.
+One clock drives every decision: **allocation volume**, the bytes the heap
+stores hand out (fresh TLAB refills plus free-list reuse). Policy depends only
+on the evaluation's own heap, never on host RAM, so an evaluation collects at
+the same points on every machine. `src/runtime/heap/pacer.zig` owns it.
 
-- Resolution order: `--gc-budget=N` (MiB, or `Nk`/`Nm`/`Ng`) → **half of `/proc/meminfo` MemTotal**, clamped by defaults of 256 MiB–32 GiB (fallback: half of an assumed 4 GiB). `FIX_GC_FLOOR` and `FIX_GC_CEILING` override those bounds with the same size syntax. The budget covers the evaluator heap stores, not total process RSS; side allocations such as chunks, interned strings, and thread stacks sit outside it. `0` = never collect (reclaim machinery remains dormant and allocation stays bump-only).
-- **Lazy arming**: below `armLineBytes(budget)`, the heap checks its reservation
-  cursor only at TLAB refill. The first crossing stops workers, classifies the
-  existing allocation as old, and enables young-object tracking, write barriers,
-  and free lists. The arm line is
-  `min(max(budget/4, 512 MiB), budget/2)`; later thresholds are at least the
-  budget and advance with reservation growth.
-- Consequence: evaluations below the arming threshold do not collect, while
-  constrained budgets begin reclamation once reservations cross the configured
-  threshold.
+- **Dormant.** Until volume reaches the arm line (1 GiB; `FIX_GC_ARM=SIZE`),
+  nothing is tracked: no young-slot lists, write barriers, or free-list probes.
+  Evaluations below the line pay nothing.
+- **Arming** stops workers, classifies the existing allocation as old (pinned),
+  and enables tracking. The pinned bytes seed the old-generation estimate.
+- **Nursery.** After each collection the next one is scheduled
+  `growth × old` bytes of allocation later (`FIX_GC_GROWTH=PCT`, default 100),
+  clamped to 64 MiB–1 GiB. `old` is the pinned region plus promotions, reset to
+  the measured live set at each major. Peak heap is therefore about
+  `old · (1 + growth)`, Go's GOGC rule applied to the nursery. The cap bounds
+  a minor's survivor trace, so it also bounds the minor's pause.
+- **Major gate.** The next collection is a major once `old` exceeds the last
+  major's live set by `major_growth` (starting at `growth`, never less than one
+  minimum nursery). This geometric gate bounds total major work by a constant
+  multiple of the final live set. A major that frees less than a quarter of
+  `old` doubles `major_growth` (capped at 1600%). A major that frees half or
+  more halves it back. Nix heaps mostly accrete, so low-yield full
+  collections, the longest pauses, back off instead of recurring.
+- **Soft limit.** `--gc-budget=N` (MiB, or `Nk`/`Nm`/`Ng`) caps `old + nursery`,
+  like GOMEMLIMIT. Tracking arms by half the limit and nurseries shrink to
+  fit. Nurseries never drop below 64 MiB and the limit never forces a major,
+  so a live set above the limit degrades to frequent cheap minors, not a
+  livelock of full collections.
+  `0` = never collect (allocation stays bump-only).
+- **Accounting.** Workers publish volume to one shared counter in 1 MiB steps
+  and request a collection when it crosses the pacer's trigger. The fresh path
+  charges once per TLAB refill, and reuse charges per allocation inside the
+  already-armed branch. The dormant hot path is unchanged.
+- **Memory return.** Freed storage stays mapped and reused through the free
+  lists. Collection never calls `madvise` or `munmap`, so reuse costs no page
+  faults or syscalls. Fresh store growth is prefaulted in 32 MiB chunks
+  (`MADV_POPULATE_WRITE`).
 
 ## Why non-moving + precise
 
@@ -31,7 +55,7 @@ bytes.
 
 ## Generational structure
 
-Routine collections are **minor** and young-gated: each minor examines only the objects allocated since the last collection — recorded per-worker in `HeapLocal.gc_young_slots` (appended on allocation once tracking is armed, cleared after each minor) — so the work is O(young), not O(total). Once promoted objects reach the major gate (the previous major's live-object count, with a one-million-object floor), the next collection performs a full, non-gated mark and sweep to reclaim unreachable old objects.
+Routine collections are **minor** and young-gated: each minor examines only the objects allocated since the last collection — recorded per-worker in `HeapLocal.gc_young_slots` (appended on allocation once tracking is armed, cleared after each minor) — so the work is O(young), not O(total). Once promotions pass the pacer's major gate (see Pacing above), the next collection performs a full, non-gated mark and sweep to reclaim unreachable old objects.
 
 - **Young/old.** Objects allocated after arming are young; a minor promotes marked survivors to old (in place) and reclaims the dead.
 - **Remembered set.** An old→young write barrier records old objects that come to reference young ones, so the young-gated mark can seed from roots *plus* the remembered set and stop at old boundaries without missing live young children.
@@ -94,7 +118,7 @@ Root set (all must be enumerated — precise):
 
 ## Safepoints
 
-- Collections fire at the `forceThunk` safepoint when the reserved-byte threshold is crossed. The coordinating fiber may enter at any native depth because builtin temporaries follow the explicit-root discipline; peer fibers park only at native-depth-zero boundaries before assisting the collection.
+- Collections fire at the `forceThunk` safepoint once allocation volume crosses the pacer's trigger. The coordinating fiber may enter at any native depth because builtin temporaries follow the explicit-root discipline; peer fibers park only at native-depth-zero boundaries before assisting the collection.
 - Current-token thunk-memo and attr-cache entries are roots because they can momentarily be the sole reference to a shared value. After collection the **heap token is bumped**, making every old cache slot miss before a recycled ObjectId can be read as the prior value.
 
 ## Single-owner range invariant
@@ -127,8 +151,8 @@ necessarily reduce process memory immediately.
 
 - **UAF detector** (ReleaseSafe): freed slots are *not reused* and every read asserts the alloc bit is set — surfaces dangling ObjectIds at the read, at their source. A companion closure check verifies the minor mark is closed (every young child of a live parent is marked) before the sweep, panicking with the offending parent→child edge so a missed barrier/root is caught at its source.
 - **Swept-range poisoning**: freed ranges are overwritten with an invalid thunk so any stale reader trips immediately.
-- **`FIX_GC_STEP_MB`**: collect every N MB of fresh allocation from a low start threshold (eager tracking, ignores the budget) to shake out rooting gaps.
+- **`FIX_GC_STEP_MB`**: arm at once and collect every N MB of allocation, ignoring heap shape and `--gc-budget`, to shake out rooting gaps.
 - **`FIX_GC_NOREUSE`** (skip free-list reuse; validate the reuse path) and **`FIX_GC_PAR_CAP`** (collection participant cap) are validation/tuning knobs.
-- **`--gc-report`** dumps the per-run collection report (pauses, promoted/freed, live vs reserved breakdown) to stderr.
+- **`--gc-report`** dumps the per-run collection report (pacer configuration and state, total and maximum pauses, promoted/freed, live vs reserved breakdown) to stderr.
 
-Code: `src/runtime/gc.zig` (the precise serial/parallel marker and metrics), `src/runtime/heap/collector.zig` (arming, sweep, and threshold policy), and `src/expr/eval/gc_controller.zig` (root enumeration, stop-the-world integration, and budget resolution). The reclaimable-headroom analysis this bounds is in [perf/model](perf/model.md); the measurement flags are in [perf/probes](perf/probes.md).
+Code: `src/runtime/heap/pacer.zig` (when to collect and whether to go major), `src/runtime/gc.zig` (the precise serial/parallel marker and metrics), `src/runtime/heap/collector.zig` (configuration, arming, sweep, and the after-collect hook that feeds the pacer), and `src/expr/eval/gc_controller.zig` (root enumeration, stop-the-world integration, and pacer configuration). The reclaimable-headroom analysis this bounds is in [perf/model](perf/model.md); the measurement flags are in [perf/probes](perf/probes.md).

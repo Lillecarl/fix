@@ -85,7 +85,7 @@ test "object construction does not consume an id when young tracking allocation 
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     var heap = try ObjectHeap.init(failing.allocator(), 1);
     defer heap.deinit();
-    heap_collector.enableCollect(&heap, 64 << 20, 0);
+    heap_collector.configureEager(&heap, .{});
 
     const before = heap.counts();
     failing.fail_index = failing.alloc_index;
@@ -482,7 +482,7 @@ test "object heap supports a single-entry attrs object" {
 test "object heap sweep frees unmarked objects and lets ids be reused" {
     var heap = try ObjectHeap.init(std.testing.allocator, 1);
     defer heap.deinit();
-    heap_collector.enableCollect(&heap, 64 << 20, 0);
+    heap_collector.configureEager(&heap, .{});
 
     // Two live (reachable) lists, two dead (unreferenced) lists.
     const live_a = try heap.addList(&.{Value.int(1)});

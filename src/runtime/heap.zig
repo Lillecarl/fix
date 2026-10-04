@@ -41,6 +41,7 @@ const FailureFrame = @import("failure.zig").FailureFrame;
 const FailureRef = @import("failure.zig").FailureRef;
 pub const inspection = @import("heap/inspection.zig");
 const reuse = @import("heap/reuse.zig");
+pub const pacing = @import("heap/pacer.zig");
 const RangeFreeList = reuse.RangeFreeList;
 const nextSetBit = reuse.nextSetBit;
 const nextClearBit = reuse.nextClearBit;
@@ -93,6 +94,8 @@ pub const GcReportState = struct {
     remset_ns_total: std.atomic.Value(u64) = .init(0),
     drain_ns_total: std.atomic.Value(u64) = .init(0),
     remset_sources_total: std.atomic.Value(u64) = .init(0),
+    /// Longest mark+sweep pause per collection kind (minor, major).
+    max_pause_ns: [2]std.atomic.Value(u64) = @splat(.init(0)),
     breakdown: [8]std.atomic.Value(u64) = @splat(.init(0)),
 };
 
@@ -574,6 +577,10 @@ pub const HeapLocal = struct {
     object_reuse_hits: u64 = 0,
     object_reuse_misses: u64 = 0,
     object_fresh_refills: u64 = 0,
+    /// Allocation volume not yet added to `collection.allocated`. Published
+    /// in `alloc_publish_quantum` steps so the shared counter sees one atomic
+    /// add per quantum per worker, not one per allocation.
+    alloc_unpublished: u64 = 0,
 
     fn deinit(self: *HeapLocal, allocator: std.mem.Allocator) void {
         self.gc_free_objects.deinit(allocator);
@@ -601,13 +608,15 @@ pub const HeapCollectionState = struct {
     /// reserved-bytes threshold — atomic monotonic (same single byte
     /// mov on x86, TSan-clean).
     collect_requested: std.atomic.Value(bool) = .init(false),
-    threshold_bytes: u64 = std.math.maxInt(u64),
-    step_bytes: u64 = 0,
-    budget_bytes: u64 = 0,
+    /// When to collect and whether to go major. Disabled until the evaluator
+    /// configures it (`collector.configure`).
+    pacer: pacing.Pacer = pacing.Pacer.disabled(),
+    /// Published allocation volume (fresh + reused bytes) — the pacer's
+    /// clock. Workers add to it in quanta; exact only after
+    /// `gcFlushAllocation` at a safepoint.
+    allocated: std.atomic.Value(u64) = .init(0),
     disable_reuse: bool = false,
     report: GcReportState = .{},
-    promoted_since_major: u64 = 0,
-    major_gate: u64,
     collect_enabled: bool = false,
     track_from: ObjectId = 0,
     bootstrap_end: ObjectId = 0,
@@ -625,23 +634,7 @@ pub const HeapCollectionState = struct {
     /// release/acquire handshake publishes this non-atomic phase bit.
     collecting_major: bool = false,
     minor_sweep_promoted: std.atomic.Value(u64) = .init(0),
-    minor_sweep_promoted_charge: std.atomic.Value(u64) = .init(0),
     minor_sweep_freed: std.atomic.Value(u64) = .init(0),
-    /// Armed after a collection leaves a worthwhile object-id reserve. The
-    /// first allocation that exhausts that reserve requests another collection
-    /// instead of silently bumping until unrelated range-store growth reaches
-    /// the global byte threshold.
-    object_miss_collect_armed: std.atomic.Value(bool) = .init(false),
-    object_miss_collect_requests: std.atomic.Value(u64) = .init(0),
-    /// Byte-store churn pacing: request a collection once cumulative fresh
-    /// byte-store growth (sum of per-worker `range_fresh_slots[bytes]`)
-    /// crosses this floor — armed by `gcArmPoolMissCollection` to
-    /// "current growth + max(reclaimed byte pool, 1 MiB)", so each
-    /// early collection requires at least a pool's worth of forward
-    /// progress (no thrash) while heap-string churn plateaus instead of
-    /// growing by the flat post-collect headroom every cycle. maxInt =
-    /// disarmed.
-    byte_growth_collect_floor: std.atomic.Value(u64) = .init(std.math.maxInt(u64)),
 };
 
 pub const ObjectHeap = struct {
@@ -760,7 +753,7 @@ pub const ObjectHeap = struct {
             .gc_shared_free_range_mu = .{},
             .gc_shared_free_range_max = @splat(.init(0)),
             .token = next_heap_token.fetchAdd(1, .monotonic),
-            .collection = .{ .major_gate = gc_major_gate_floor },
+            .collection = .{},
         };
     }
 
@@ -1134,14 +1127,14 @@ pub const ObjectHeap = struct {
             const local = self.currentLocal();
             local.range_fresh_refills[store_index] += 1;
             local.range_fresh_slots[store_index] += n;
-            self.gcCheckThreshold();
+            self.chargeAllocation(local, @as(u64, n) * StoreT.stored_slot_bytes);
             return range;
         }
         const refilled = try store.reserve(self.allocator, chunk_size);
         const local = self.currentLocal();
         local.range_fresh_refills[store_index] += 1;
         local.range_fresh_slots[store_index] += chunk_size;
-        self.gcCheckThreshold();
+        self.chargeAllocation(local, @as(u64, chunk_size) * StoreT.stored_slot_bytes);
         chunk.segment = refilled.segment;
         chunk.cursor = refilled.offset;
         chunk.end = refilled.offset + refilled.len;
@@ -1191,7 +1184,6 @@ pub const ObjectHeap = struct {
             if (n > 0) {
                 local.range_reuse_miss[store_index] += 1;
                 local.range_reuse_miss_slots[store_index] += n;
-                self.gcNoteRangePoolMiss(si);
             }
             return null;
         }
@@ -1217,7 +1209,6 @@ pub const ObjectHeap = struct {
         if (n > 0) {
             local.range_reuse_miss[store_index] += 1;
             local.range_reuse_miss_slots[store_index] += n;
-            self.gcNoteRangePoolMiss(si);
         }
         return null;
     }
@@ -1269,7 +1260,6 @@ pub const ObjectHeap = struct {
         hits: u64 = 0,
         misses: u64 = 0,
         fresh_refills: u64 = 0,
-        collect_requests: u64 = 0,
     };
 
     pub fn objectReuseStats(self: *const ObjectHeap) ObjectReuseStats {
@@ -1279,7 +1269,6 @@ pub const ObjectHeap = struct {
             total.misses += local.object_reuse_misses;
             total.fresh_refills += local.object_fresh_refills;
         }
-        total.collect_requests = self.collection.object_miss_collect_requests.load(.monotonic);
         return total;
     }
 
@@ -1307,56 +1296,6 @@ pub const ObjectHeap = struct {
             local.gc_free_objects.clearRetainingCapacity();
         }
         self.gc_shared_free_count.store(self.gc_shared_free_objects.items.len, .release);
-    }
-
-    /// Re-arm the pool-exhaustion trigger only when the completed
-    /// collection produced enough reusable storage to amortize another
-    /// pause — a worthwhile OBJECT pool or a worthwhile BYTE pool (heap-
-    /// string churn can dominate while the object pool stays modest). If a
-    /// growing live set leaves little or nothing free, the ordinary byte
-    /// headroom remains the sole trigger and prevents collection thrashing.
-    pub fn gcArmPoolMissCollection(self: *ObjectHeap) void {
-        const min_reclaimed_slots: usize = 1 << 16;
-        const min_reclaimed_bytes: u64 = 1 << 20;
-        var objects_available = self.gc_shared_free_count.load(.acquire);
-        for (self.worker_locals) |*local| objects_available += local.gc_free_objects.items.len;
-        self.collection.object_miss_collect_armed.store(objects_available >= min_reclaimed_slots, .release);
-
-        // Byte-store churn pacing (see `byte_growth_collect_floor`): only a
-        // worthwhile reclaimed byte pool arms the growth floor, and the
-        // floor demands at least that pool's worth of fresh growth before
-        // the next early collection.
-        var bytes_available: u64 = self.gc_shared_free_bytes.stats().slots;
-        for (self.worker_locals) |*local| bytes_available += local.gc_free_bytes.stats().slots;
-        self.collection.byte_growth_collect_floor.store(
-            if (bytes_available >= min_reclaimed_bytes)
-                self.byteFreshGrowth() + @max(bytes_available, min_reclaimed_bytes)
-            else
-                std.math.maxInt(u64),
-            .release,
-        );
-    }
-
-    /// Fresh byte-store growth signal: the store cursor. Cursor reads are
-    /// synchronized (StableSegments), unlike the per-worker fresh-slot
-    /// diagnostic counters, which are single-writer and must not be read
-    /// cross-thread.
-    fn byteFreshGrowth(self: *const ObjectHeap) u64 {
-        return self.bytes.count();
-    }
-
-    /// Byte-range pool miss (cold path): once fresh byte-store growth
-    /// crosses the armed floor, request one early safepoint collection —
-    /// the range-store analogue of the object pool-miss trigger, and what
-    /// keeps heap-string churn's footprint a plateau rather than growing
-    /// by the flat post-collect headroom every cycle.
-    fn gcNoteRangePoolMiss(self: *ObjectHeap, comptime si: usize) void {
-        if (comptime si != rangeStoreIndex("bytes")) return;
-        const floor = self.collection.byte_growth_collect_floor.load(.acquire);
-        if (self.byteFreshGrowth() < floor) return;
-        self.collection.byte_growth_collect_floor.store(std.math.maxInt(u64), .release);
-        self.collection.collect_requested.store(true, .monotonic);
-        _ = self.collection.object_miss_collect_requests.fetchAdd(1, .monotonic);
     }
 
     /// Detector-only byte-store ownership audit: every live `heap_string`'s
@@ -1521,9 +1460,13 @@ pub const ObjectHeap = struct {
         if (self.collection.collect_enabled) {
             if (free_list.pop(self.allocator, n)) |hit| {
                 if (hit.split) local.range_reuse_split[si] += 1 else local.range_reuse_exact[si] += 1;
+                self.chargeAllocation(local, @as(u64, n) * row.Store.stored_slot_bytes);
                 return .{ .segment = hit.loc.segment, .offset = hit.loc.offset, .len = n };
             }
-            if (self.gcReuseSharedRange(local, si, n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
+            if (self.gcReuseSharedRange(local, si, n)) |loc| {
+                self.chargeAllocation(local, @as(u64, n) * row.Store.stored_slot_bytes);
+                return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
+            }
         } else if (free_list.maxLen() >= n) {
             // Aborted construction ranges can exist before collection is
             // armed. Reuse them locally without entering the GC shared pool.
@@ -1645,11 +1588,36 @@ pub const ObjectHeap = struct {
         });
     }
 
-    /// Threshold hook: once reserved bytes cross `collection.threshold_bytes`, request a
-    /// (non-moving) collection to run at the next forceThunk safepoint — it marks
-    /// live, promotes survivors in place, and frees dead ranges to the free lists.
-    inline fn gcCheckThreshold(self: *ObjectHeap) void {
-        if (self.totalReservedBytes() >= self.collection.threshold_bytes) self.collection.collect_requested.store(true, .monotonic);
+    /// Per-worker publication step for allocation volume. Bounds the pacer's
+    /// trigger error to one quantum per worker.
+    const alloc_publish_quantum: u64 = 1 << 20;
+
+    /// Advance the pacer's clock by `bytes` handed out on this worker (fresh
+    /// TLAB refills, oversized reservations, and free-list reuse). Once the
+    /// published volume crosses the pacer's trigger, request a collection at
+    /// the next forceThunk safepoint.
+    inline fn chargeAllocation(self: *ObjectHeap, local: *HeapLocal, bytes: u64) void {
+        local.alloc_unpublished += bytes;
+        if (local.alloc_unpublished >= alloc_publish_quantum) self.publishAllocation(local);
+    }
+
+    noinline fn publishAllocation(self: *ObjectHeap, local: *HeapLocal) void {
+        const n = local.alloc_unpublished;
+        local.alloc_unpublished = 0;
+        const total = self.collection.allocated.fetchAdd(n, .monotonic) + n;
+        if (total >= self.collection.pacer.trigger.load(.monotonic))
+            self.collection.collect_requested.store(true, .monotonic);
+    }
+
+    /// Fold every worker's unpublished volume into `collection.allocated` and
+    /// return it. Safepoint only: other workers' counters are single-writer.
+    pub fn gcFlushAllocation(self: *ObjectHeap) u64 {
+        var pending: u64 = 0;
+        for (self.worker_locals) |*local| {
+            pending += local.alloc_unpublished;
+            local.alloc_unpublished = 0;
+        }
+        return self.collection.allocated.fetchAdd(pending, .monotonic) + pending;
     }
 
     /// Register the collect callback. Fired at
@@ -1709,18 +1677,10 @@ pub const ObjectHeap = struct {
             if (self.collection.collect_enabled and !self.collection.disable_reuse and !gc_debug) {
                 if (self.gcReuseObject(local)) |rid| {
                     local.object_reuse_hits += 1;
+                    self.chargeAllocation(local, @sizeOf(Object));
                     break :blk .{ .id = rid, .reused = true };
                 }
                 local.object_reuse_misses += 1;
-                // Disarmed is overwhelmingly the common case. Avoid a locked
-                // RMW on every fresh object allocation; only contenders that
-                // observe an armed trigger pay for the one-winner transition.
-                if (self.collection.object_miss_collect_armed.load(.monotonic) and
-                    self.collection.object_miss_collect_armed.cmpxchgStrong(true, false, .acq_rel, .monotonic) == null)
-                {
-                    self.collection.collect_requested.store(true, .monotonic);
-                    _ = self.collection.object_miss_collect_requests.fetchAdd(1, .monotonic);
-                }
             }
             const chunk = &local.object;
             if (chunk.cursor < chunk.end) {
@@ -1730,6 +1690,7 @@ pub const ObjectHeap = struct {
             }
             const refilled = try self.objects.reserve(self.allocator, object_chunk_size);
             local.object_fresh_refills += 1;
+            self.chargeAllocation(local, @as(u64, refilled.len) * @sizeOf(Object));
             chunk.segment = refilled.segment;
             chunk.cursor = refilled.offset;
             chunk.end = refilled.offset + refilled.len;
@@ -1784,16 +1745,6 @@ pub const ObjectHeap = struct {
     }
 
     // --- GC allocation and reclamation state ---
-
-    /// Floor on the major-collection gate (see `collection.major_gate`): promote at
-    /// least this many objects since the last major before the next one, so a
-    /// small heap never major-thrashes. Above the floor the gate tracks the
-    /// live set (major when the old gen has roughly doubled with tenurings).
-    pub const gc_major_gate_floor: u64 = 1 << 20;
-    /// Headroom of genuinely-fresh committed pages between collections
-    /// (additive, anchored to the cursor at last collect — see
-    /// `gcAfterCollect`). Keeps peak RSS near live + a constant.
-    pub const gc_headroom: u64 = 1024 << 20;
 
     /// A/B knob (`FIX_GC_NOREUSE`): skip free-list reuse on the allocation hot
     /// paths (bump-allocate instead). Measurement only — loses the RSS bound.
@@ -2050,12 +2001,6 @@ pub const ObjectHeap = struct {
     pub const MinorStats = struct {
         promoted: u64 = 0,
         freed: u64 = 0,
-        /// Byte-weighted extra promotion charge (`gc_bytes_per_object_charge`
-        /// per tenured heap-string byte block): a tenured 4 KiB string must
-        /// press on the major gate like the dozens of objects it displaces,
-        /// or dead tenured string churn accumulates gigabytes between
-        /// object-counted majors.
-        promoted_charge: u64 = 0,
     };
 
     /// Grab the next marker slot for this worker (collector or peer). A slot
@@ -2099,37 +2044,14 @@ pub const ObjectHeap = struct {
         if (self.collection.root_always) self.collection.track_from = self.collection.bootstrap_end;
     }
 
-    /// Major-collection policy hooks (see `collection.major_gate`).
-    /// Should the next in-eval collection be a MAJOR? True once enough objects
-    /// have tenured since the last major that the old generation likely holds a
-    /// live-set's worth of reclaimable garbage.
+    /// Should the next in-eval collection be a MAJOR?
     pub fn gcShouldMajor(self: *const ObjectHeap) bool {
         // Constrained mode keeps precise transient roots from evaluation start
-        // specifically so the pre-arming half-budget can be reclaimed. Until
-        // one major reconciles it, `track_from` still points at the later
-        // arming boundary; don't leave that large region pinned merely because
-        // a short allocation-heavy run never reaches the promotion gate.
+        // specifically so the pre-arming region can be reclaimed. Until one
+        // major reconciles it, `track_from` still points at the later arming
+        // boundary; don't leave that region pinned waiting on the pacer.
         if (self.collection.root_always and self.collection.track_from != self.collection.bootstrap_end) return true;
-        return self.collection.promoted_since_major >= self.collection.major_gate;
-    }
-
-    /// Per how many tenured heap-string BYTES the major gate is charged one
-    /// extra object-equivalent (see `MinorStats.promoted_charge`).
-    pub const gc_bytes_per_object_charge: u32 = 64;
-
-    /// A minor tenured objects worth `charge` gate units (object count plus
-    /// the byte-weighted heap-string surcharge); press them against the
-    /// major gate.
-    pub fn gcNoteMinorPromoted(self: *ObjectHeap, charge: u64) void {
-        self.collection.promoted_since_major += charge;
-    }
-
-    /// A major just ran, leaving `live_objects` alive (all now tenured). Reset
-    /// the promotion counter and re-arm the gate to the new live set (floored),
-    /// so the next major fires once the old gen has ~doubled again.
-    pub fn gcNoteMajor(self: *ObjectHeap, live_objects: u64) void {
-        self.collection.promoted_since_major = 0;
-        self.collection.major_gate = @max(gc_major_gate_floor, live_objects);
+        return self.collection.pacer.wantMajor();
     }
 
     pub fn getMut(self: *ObjectHeap, id: ObjectId) *Object {

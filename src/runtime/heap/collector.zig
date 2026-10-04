@@ -1,5 +1,6 @@
 //! GC collector driver for `ObjectHeap`: marking, generational sweep, and
-//! threshold policy over the heap's storage model.
+//! the collection lifecycle (configure, arm, after-collect) that feeds the
+//! pacer (`pacer.zig`), over the heap's storage model.
 //!
 //! These are free functions over `heap: *ObjectHeap` rather than methods (Zig
 //! cannot add methods to a struct from another file). Hot allocation helpers
@@ -137,59 +138,16 @@ pub fn sweep(heap: *ObjectHeap, mark_bits: []const u64) SweepStats {
     return stats;
 }
 
-/// Turn on reclaim (alloc-bitmap maintenance + free-list reuse + sweep)
-/// with a memory `budget` (the reserved-bytes ceiling the collector
-/// defends — see `ObjectHeap.collection.budget_bytes`). `step_bytes` > 0 is the
-/// validation override: collect every that-many bytes of fresh allocation
-/// from a low starting threshold, ignoring the budget.
-pub fn enableCollect(heap: *ObjectHeap, budget: u64, step_bytes: u64) void {
-    heap.collection.step_bytes = step_bytes;
-    heap.collection.budget_bytes = budget;
-    // Collect after fresh reservations cross the configured threshold.
-    heap.collection.threshold_bytes = if (step_bytes > 0) heap.totalReservedBytes() + step_bytes else budget;
-    // Validation path arms eagerly (bootstrap_end == the arming count, so the
-    // pre-arming region is empty), but turn on constrained mode so the always-
-    // on transient-root gates are exercised. `armTracking` enables root tracking.
-    heap.collection.bootstrap_end = heap.objects.count();
-    heap.collection.root_always = true;
-    // Detector: presize the alloc bitmap here, like the constrained `enableBudget`
-    // path. `armTracking` only presizes outside constrained mode, so without this
-    // the eager step path would arm with a ZERO-length bitmap — every per-fill
-    // `gcSetAllocBit` would silently drop its bit (word >= len) and the very
-    // first tracked read would false-trap "read after sweep". (`armTracking`
-    // below then skips its own presize, preserving this freshly-zeroed map.)
-    if (comptime gc_debug) heap.gcPresizeAllocBits();
-    armTracking(heap);
-}
-
-/// Bytes of reserved growth at which the lazy path arms tracking+rooting:
-/// a QUARTER of the line (floored at 512 MiB, capped at line/2 so tiny
-/// budgets still arm before they collect). Everything allocated before
-/// arming stays pinned, so a lower arm line shrinks the unreclaimable
-/// floor — measured on whole-nixpkgs: arming at line/2 (16 GiB) left
-/// collections 13 GiB less effective than early rooting. A run that
-/// never reaches the arm line pays ZERO tracking or rooting cost, which
-/// is what keeps small evals exactly as fast under any budget form.
-pub fn armLineBytes(budget: u64) u64 {
-    const floor: u64 = 512 << 20;
-    return @min(@max(budget / 4, floor), budget / 2);
-}
-
-/// Lazy collection-line policy (the production default, see
-/// `gc_controller.memoryBudget`): don't start any per-allocation tracking yet — just
-/// watch the reserved-bytes cursor. At `armLineBytes` the safepoint driver arms
-/// tracking (STW, `armTracking`); at the line it collects. A run that never
-/// reaches the arm line pays ZERO tracking cost (no young-slot appends, no write
-/// barrier, no free-list probes). The price: objects allocated before arming are
-/// permanently old (unreclaimable floor ≈ reserved at the arm line)
-/// UNLESS `root_always` (`FIX_GC_ROOTS=1` / the step validation path): then a
-/// major also reclaims that pre-arming region, paid for by keeping the
-/// transient-root gates live from here. `collection.bootstrap_end` is captured
-/// now as the reclaim boundary (bootstrap below it stays pinned).
-pub fn enableBudget(heap: *ObjectHeap, budget: u64, root_always: bool) void {
-    heap.collection.step_bytes = 0;
-    heap.collection.budget_bytes = budget;
-    heap.collection.threshold_bytes = armLineBytes(budget);
+/// Install the collection policy before evaluation starts. Nothing is tracked
+/// until the pacer's arm trigger fires (`arm`); a run that never reaches it
+/// pays no tracking, barrier, or free-list cost. Objects allocated before
+/// arming stay pinned (permanently old) UNLESS `root_always`
+/// (`FIX_GC_ROOTS=1` / the step validation path): then transient-root gates
+/// stay live from here and the first major also reclaims the pre-arming
+/// region. `collection.bootstrap_end` is captured now as the reclaim boundary
+/// (bootstrap below it stays pinned).
+pub fn configure(heap: *ObjectHeap, config: heap_mod.pacing.Config, root_always: bool) void {
+    heap.collection.pacer = heap_mod.pacing.Pacer.init(config);
     heap.collection.bootstrap_end = heap.objects.count();
     heap.collection.root_always = root_always;
     heap.collection.root_active = root_always;
@@ -197,6 +155,13 @@ pub fn enableBudget(heap: *ObjectHeap, budget: u64, root_always: bool) void {
     // size the bitmap now — arming won't be the first sizer, and its re-size
     // outside constrained mode would otherwise wipe bits set in between.
     if (comptime gc_debug) if (root_always) heap.gcPresizeAllocBits();
+}
+
+/// `configure` with precise roots, then arm at once: every later allocation
+/// is young. The validation path (`FIX_GC_STEP_MB`) and unit tests use this.
+pub fn configureEager(heap: *ObjectHeap, config: heap_mod.pacing.Config) void {
+    configure(heap, config, true);
+    arm(heap);
 }
 
 /// Start young-slot tracking, the old-to-young write barrier, and free-list
@@ -222,15 +187,13 @@ pub fn armTracking(heap: *ObjectHeap) void {
     if (comptime gc_debug) if (!heap.collection.root_always) heap.gcPresizeAllocBits();
 }
 
-/// The `armLineBytes` STW safepoint under the lazy policy: arm tracking and
-/// re-arm the threshold to the full budget. No mark, no sweep, no token bump —
+/// The pacer's arm trigger fired (STW, or before evaluation): start tracking
+/// and schedule the first collection. No mark, no sweep, no token bump —
 /// nothing allocated so far is tracked, so there is nothing to reclaim yet.
-pub fn armLazy(heap: *ObjectHeap) void {
+pub fn arm(heap: *ObjectHeap) void {
     armTracking(heap);
     heap.collection.collect_requested.store(false, .monotonic);
-    const budget = heap.collection.budget_bytes;
-    const headroom = std.math.clamp(budget / 8, 64 << 20, ObjectHeap.gc_headroom);
-    heap.collection.threshold_bytes = @max(budget, heap.totalReservedBytes() + headroom);
+    heap.collection.pacer.onArm(heap.gcFlushAllocation(), heap.totalReservedBytes());
 }
 
 /// Run a collection now via the registered callback (the evaluator's
@@ -240,30 +203,28 @@ pub fn runCollect(heap: *ObjectHeap, collector_id: u8) void {
     if (heap.collection.hook) |h| h.sample(h.ctx, collector_id);
 }
 
-/// Called by the evaluator after a sweep: clear the request and set the
-/// next threshold. The store cursors are monotonic — non-moving reuse
-/// returns freed ranges to the free lists but never lowers
-/// `totalReservedBytes` — so the threshold must be relative to the
-/// CURSOR NOW, not the live set: collect again only once we've committed
-/// another `gc_headroom` of genuinely fresh pages (i.e. the free lists
-/// drained and the cursor actually grew). Anchoring to live would leave
-/// the threshold permanently below the cursor → collect every safepoint
-/// (livelock). `live_bytes` is accepted for stats only.
-pub fn afterCollect(heap: *ObjectHeap, live_bytes: u64) void {
-    _ = live_bytes;
+pub const Outcome = union(enum) {
+    /// A minor tenured this many bytes.
+    minor: u64,
+    /// A major left this many bytes live.
+    major: u64,
+    /// The collection could not run (tracer allocation failed); reschedule.
+    skipped,
+};
+
+/// Called by the evaluator after every collection attempt: clear the
+/// request, let the pacer schedule the next one, and invalidate caches.
+/// Collection never lowers the store cursors (non-moving reuse refills from
+/// the free lists), so the pacer counts allocation volume, not footprint.
+pub fn afterCollect(heap: *ObjectHeap, outcome: Outcome) void {
     if (comptime gc_debug) heap.gcVerifyByteRanges();
     heap.collection.collect_requested.store(false, .monotonic);
-    // Post-collect headroom scales with the budget (an eighth, clamped to
-    // [64 MB, gc_headroom]): a small-RAM budget must not grant itself a
-    // flat 1 GB of growth per cycle, and a huge budget needn't collect
-    // every 64 MB once it has (somehow) been crossed.
-    const budget = heap.collection.budget_bytes;
-    const headroom = std.math.clamp(budget / 8, 64 << 20, ObjectHeap.gc_headroom);
-    heap.collection.threshold_bytes = if (heap.collection.step_bytes > 0)
-        heap.totalReservedBytes() + heap.collection.step_bytes
-    else
-        @max(budget, heap.totalReservedBytes() + headroom);
-    heap.gcArmPoolMissCollection();
+    const allocated = heap.gcFlushAllocation();
+    switch (outcome) {
+        .minor => |promoted| heap.collection.pacer.onMinor(allocated, promoted),
+        .major => |live| heap.collection.pacer.onMajor(allocated, live),
+        .skipped => heap.collection.pacer.onMinor(allocated, 0),
+    }
     // Invalidate all thread-local caches (thunk memo, attr IC, call IC)
     // that key on `token`. Current thunk-memo and attr-cache values were
     // traced as roots for this collection because a cache may momentarily be
@@ -345,6 +306,7 @@ const ClosureSink = struct {
         for (heap.attrs.slice(range)) |entry_value| try self.value(heap, entry_value);
     }
     pub inline fn attrPositions(_: *ClosureSink, _: heap_mod.AttrPositions) Error!void {}
+    pub inline fn stringBytes(_: *ClosureSink, _: u64) Error!void {}
     pub inline fn capturedValues(self: *ClosureSink, heap: *const ObjectHeap, values: []const Value, _: bool) Error!void {
         for (values) |child| try self.value(heap, child);
     }
@@ -413,12 +375,6 @@ fn sweepYoungListInto(heap: *ObjectHeap, src_ids: []const ObjectId, dst: *HeapLo
         if (marked) {
             heap.gcSetOld(id);
             st.promoted += 1;
-            // Byte-weighted gate charge for tenured string text (see
-            // MinorStats.promoted_charge).
-            switch (heap.objects.get(id).*) {
-                .heap_string => |hs| st.promoted_charge += hs.bytes.len / ObjectHeap.gc_bytes_per_object_charge,
-                else => {},
-            }
         } else {
             // Detector builds retain the slot so stale reads trap reliably.
             freeObjectRanges(heap, ranges, heap.objects.get(id));
@@ -443,7 +399,6 @@ pub fn beginMinorSweep(heap: *ObjectHeap, worker_count: u8) void {
     heap.collection.minor_sweep_next.store(0, .monotonic);
     heap.collection.minor_sweep_done.store(0, .monotonic);
     heap.collection.minor_sweep_promoted.store(0, .monotonic);
-    heap.collection.minor_sweep_promoted_charge.store(0, .monotonic);
     heap.collection.minor_sweep_freed.store(0, .monotonic);
     heap.collection.minor_sweep_open.store(false, .release);
 }
@@ -470,7 +425,6 @@ pub fn minorSweepClaimLoop(heap: *ObjectHeap, mark_bits: []const u64) void {
         _ = heap.collection.minor_sweep_done.fetchAdd(1, .release);
     }
     _ = heap.collection.minor_sweep_promoted.fetchAdd(local_st.promoted, .monotonic);
-    _ = heap.collection.minor_sweep_promoted_charge.fetchAdd(local_st.promoted_charge, .monotonic);
     _ = heap.collection.minor_sweep_freed.fetchAdd(local_st.freed, .monotonic);
 }
 
@@ -484,7 +438,6 @@ pub fn finishMinorSweep(heap: *ObjectHeap) ObjectHeap.MinorStats {
     heap.gcRebalanceFreeLists();
     return .{
         .promoted = heap.collection.minor_sweep_promoted.load(.monotonic),
-        .promoted_charge = heap.collection.minor_sweep_promoted_charge.load(.monotonic),
         .freed = heap.collection.minor_sweep_freed.load(.monotonic),
     };
 }

@@ -72,11 +72,10 @@ pub fn report(
     p("  attr-pos store: {d:>8.1} MB\n", .{mb(apos_b)});
     p("  -- stores total:{d:>8.1} MB\n", .{mb(stores_b)});
     const object_reuse = heap.objectReuseStats();
-    p("  object reuse (hit / miss / fresh 256-slot refills / pool-empty collects): {d} / {d} / {d} / {d}\n", .{
+    p("  object reuse (hit / miss / fresh 8192-slot refills): {d} / {d} / {d}\n", .{
         object_reuse.hits,
         object_reuse.misses,
         object_reuse.fresh_refills,
-        object_reuse.collect_requests,
     });
     const reuse = heap.rangeReuseStats();
     p("  range reuse (exact / split / miss):\n", .{});

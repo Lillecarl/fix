@@ -85,7 +85,7 @@ test "parallel: automatic collector dispatches a major with 4 workers" {
     // Force the normal collection hook (not collectMajorNow's direct call) to
     // take its major branch. This is the policy state a sufficiently large
     // preceding minor would establish in a real evaluation.
-    ev.heap.gcNoteMinorPromoted(std.math.maxInt(u64));
+    ev.heap.collection.pacer.old_bytes = std.math.maxInt(u64);
     const collected = ev.collectNow();
     try std.testing.expectEqual(@as(u64, 1), collected.collections);
     try std.testing.expect(!ev.heap.isObjectAllocatedForTest(garbage_id));

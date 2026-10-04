@@ -232,7 +232,7 @@ eval is just the "pin everything" caller of the same machinery.
 | `--workers N` | worker threads; default `min(12, cpu_count)` (1 if single-threaded) → [parallel/workers.md](parallel/workers.md) |
 | `--no-compile-cache` | do not read or write the persistent compiled-chunk cache; compile everything from source → [compiler/chunk-cache.md](compiler/chunk-cache.md) |
 | `--compile-cache-dir DIR` | compiled-chunk cache root (default `$XDG_CACHE_HOME/fix/chunks`, else `~/.cache/fix/chunks`) → [compiler/chunk-cache.md](compiler/chunk-cache.md) |
-| `--gc-budget SIZE` | evaluator-heap budget before collection kicks in (MiB, or a `k`/`m`/`g` suffix; `0` = never collect; default RAM-scaled) → [gc.md](gc.md) |
+| `--gc-budget SIZE` | soft limit on the GC-managed heap (MiB, or a `k`/`m`/`g` suffix; `0` = never collect; default none: the heap is sized from the live set) → [gc.md](gc.md) |
 | `--hugetlb auto\|on\|off` | back the evaluation heap with explicit 2 MB huge pages (default `auto`: only when the kernel pool has ≥256 MB unreserved capacity). Provision the pool with `sysctl vm.nr_hugepages=N` → [perf/hugetlb.md](perf/hugetlb.md) |
 | `--show-trace` | full evaluation traces on error |
 | `--debugger` (eval, repl) | pause into the interactive debug console at `builtins.break` and on evaluation errors; forces `--workers=1`. See [The debugger](#the-debugger). |

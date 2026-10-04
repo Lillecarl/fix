@@ -49,7 +49,8 @@ pub fn walkObject(
         },
         .context_string => |string| try sink.attrRange(heap, string.context),
         .thunk => |*thunk| try walkThunk(Sink, sink, heap, thunk),
-        .boxed_int, .heap_string, .heap_string_inline => {},
+        .heap_string => |string| try sink.stringBytes(string.bytes.len),
+        .boxed_int, .heap_string_inline => {},
     }
 }
 
@@ -146,6 +147,7 @@ const ReferenceSink = struct {
     }
 
     pub inline fn attrPositions(_: *ReferenceSink, _: heap_mod.AttrPositions) Error!void {}
+    pub inline fn stringBytes(_: *ReferenceSink, _: u64) Error!void {}
 
     pub fn capturedValues(self: *ReferenceSink, heap: *const ObjectHeap, values: []const Value, _: bool) Error!void {
         for (values) |child| try self.value(heap, child);

@@ -6,12 +6,12 @@
 //!
 
 const std = @import("std");
-const builtin = @import("builtin");
 const observ = @import("base").observ;
 const gc = @import("runtime").gc;
 const types = @import("runtime").types;
 const ObjectHeap = @import("runtime").heap.ObjectHeap;
 const heap_collector = @import("runtime").heap_collector;
+const Pacing = @import("runtime").heap.pacing;
 const thunk_mod = @import("runtime").thunk;
 const future_mod = @import("runtime").future;
 const vm_force = @import("../vm.zig").force;
@@ -110,10 +110,10 @@ pub fn helpMark(ev: Context, worker_id: u8) void {
 
 /// Run one stop-the-world generational collection at a safepoint.
 pub fn collect(ev: Context, collector_id: u8) void {
-    // The first threshold crossing arms tracking; collection starts at the
-    // full budget. The world is already stopped for publication.
+    // The pacer's first trigger arms tracking; it schedules the first real
+    // collection. The world is already stopped for publication.
     if (!ev.heap.collection.collect_enabled) {
-        heap_collector.armLazy(ev.heap);
+        heap_collector.arm(ev.heap);
         return;
     }
     // A full mark is safe with multiple evaluator workers: the collection
@@ -139,7 +139,7 @@ pub fn collect(ev: Context, collector_id: u8) void {
     if (ev.worker_count > 1) {
         const marker_count = @min(@as(u32, ev.worker_count), ev.parallel_cap);
         tr.resetParallelMinor(ev.heap.counts().objects, marker_count) catch {
-            heap_collector.afterCollect(ev.heap, ev.heap.totalReservedBytes());
+            heap_collector.afterCollect(ev.heap, .skipped);
             return;
         };
         heap_collector.beginMinorSweep(ev.heap, ev.worker_count);
@@ -169,7 +169,7 @@ pub fn collect(ev: Context, collector_id: u8) void {
             }
         };
         tr.resetMinor(ev.heap.counts().objects) catch {
-            heap_collector.afterCollect(ev.heap, ev.heap.totalReservedBytes());
+            heap_collector.afterCollect(ev.heap, .skipped);
             return;
         };
         const p0 = nowNs();
@@ -189,12 +189,10 @@ pub fn collect(ev: Context, collector_id: u8) void {
         heap_collector.minorCollect(ev.heap, tr.mark_bits);
     const t2 = nowNs();
     heap_collector.remsetClear(ev.heap);
-    // Charge this minor's tenurings against the major gate: once enough has
-    // accumulated in the old generation, the next collection escalates.
-    ev.heap.gcNoteMinorPromoted(st.promoted + st.promoted_charge);
-    heap_collector.afterCollect(ev.heap, tr.stats.bytes);
+    // Young survivors are tenured: they grow the pacer's old generation.
+    heap_collector.afterCollect(ev.heap, .{ .minor = tr.stats.bytes });
     gc.recordCollection(&ev.heap.collection.report, .minor, st.freed, tr.stats, ev.heap.totalReservedBytes());
-    gc.recordTiming(&ev.heap.collection.report, t1 - t0, t2 - t1);
+    gc.recordTiming(&ev.heap.collection.report, .minor, t1 - t0, t2 - t1);
     const reserved = ev.heap.counts();
     gc.recordBreakdown(&ev.heap.collection.report, .{
         .obj_live = tr.stats.objects,
@@ -219,10 +217,10 @@ pub fn collect(ev: Context, collector_id: u8) void {
 /// the full mark; the collector performs the full sweep serially.
 pub fn collectMajor(ev: Context, collector_id: u8) void {
     _ = collector_id; // marker slot grabbed dynamically, like the minor
-    // Same lazy-arm as the minor: the first crossing arms tracking (everything
+    // Same lazy-arm as the minor: the first trigger arms tracking (everything
     // so far becomes untracked/old) rather than collecting.
     if (!ev.heap.collection.collect_enabled) {
-        heap_collector.armLazy(ev.heap);
+        heap_collector.arm(ev.heap);
         return;
     }
     var observation = ev.observer.begin(&gc_observation, .{ .subject = .{ .text = "major" } });
@@ -243,7 +241,7 @@ pub fn collectMajor(ev: Context, collector_id: u8) void {
     if (ev.worker_count > 1) {
         const marker_count = @min(@as(u32, ev.worker_count), ev.parallel_cap);
         tr.resetParallel(ev.heap.counts().objects, marker_count) catch {
-            heap_collector.afterCollect(ev.heap, ev.heap.totalReservedBytes());
+            heap_collector.afterCollect(ev.heap, .skipped);
             return;
         };
         // The minor resets this dispenser in beginMinorSweep. A major has no
@@ -264,7 +262,7 @@ pub fn collectMajor(ev: Context, collector_id: u8) void {
         tr.sumStats();
     } else {
         tr.resetMajor(ev.heap.counts().objects) catch {
-            heap_collector.afterCollect(ev.heap, ev.heap.totalReservedBytes());
+            heap_collector.afterCollect(ev.heap, .skipped);
             return;
         };
         markRoots(ev, tr);
@@ -289,13 +287,11 @@ pub fn collectMajor(ev: Context, collector_id: u8) void {
     // Every helper finished its full-mark drain before the sweep began and has
     // skipped the minor phase. Restore the mode for the next collection.
     ev.heap.collection.collecting_major = false;
-    // Re-arm the major gate to the surviving live set: the next major fires once
-    // the old generation has roughly doubled with fresh tenurings again.
-    ev.heap.gcNoteMajor(tr.stats.objects);
     const t2 = nowNs();
-    heap_collector.afterCollect(ev.heap, tr.stats.bytes);
+    // The live set is the pacer's new old generation and major base.
+    heap_collector.afterCollect(ev.heap, .{ .major = tr.stats.bytes });
     gc.recordCollection(&ev.heap.collection.report, .major, st.objects_freed, tr.stats, ev.heap.totalReservedBytes());
-    gc.recordTiming(&ev.heap.collection.report, t1 - t0, t2 - t1);
+    gc.recordTiming(&ev.heap.collection.report, .major, t1 - t0, t2 - t1);
     const reserved = ev.heap.counts();
     gc.recordBreakdown(&ev.heap.collection.report, .{
         .obj_live = tr.stats.objects,
@@ -315,71 +311,42 @@ pub fn collectMajor(ev: Context, collector_id: u8) void {
 
 pub const nowNs = clock.monotonicNs;
 
-// --- collection policy (the automatic line) -------------------------------
+// --- collection policy ------------------------------------------------------
 //
-// One coarse decision, made once, from one stable number — total RAM. We keep
-// the object stores under `clamp(fraction × MemTotal, floor, ceiling)`:
-//   - below the line, never collect: small evals, and any eval on a roomy
-//     machine, run flat-out (no pauses, no tracking) — the "waste" is RAM you
-//     weren't going to use;
-//   - above it, collect so the stores stop ballooning (a tight machine reclaims
-//     before it OOMs; a roomy one never gets there);
-//   - the CLAMP scales it: a floor so a tiny box doesn't thrash small evals, a
-//     ceiling so a huge box doesn't sit on absurd garbage (bounded absolute
-//     waste). After a major the collector floats the threshold up toward the
-//     true live set (see `heap_collector.afterCollect`), so a genuinely big heap
-//     doesn't thrash the line.
-//
-// Deliberately NOT consulted: swap, hugetlb accounting, RSS-vs-reserved,
-// moment-to-moment MemAvailable. Those are diagnostics; if an eval genuinely
-// outgrows RAM that's the kernel's job (swap / OOM), not ours to micro-manage.
-// The flag/env is a pure OVERRIDE — pin a ceiling (CI) or `0` to disable.
+// The pacer (`runtime/heap/pacer.zig`) decides when to collect from the
+// evaluation's own heap shape: allocation volume, tenured bytes, and the live
+// set at the last major. Nothing here reads host memory, so a given
+// evaluation collects at the same points on every machine. `--gc-budget` is
+// an optional soft limit on top; the environment knobs are tuning and
+// validation overrides.
 
-/// Fraction of RAM the stores may reach before collecting (num/den), and the
-/// default clamp bounds. The bounds are overridable per run via `FIX_GC_FLOOR`
-/// / `FIX_GC_CEILING` (same SIZE syntax as `--gc-budget`).
-pub const gc_limit_numerator: u64 = 1;
-pub const gc_limit_denominator: u64 = 2; // half of RAM
-pub const gc_limit_floor: u64 = 256 << 20; // 256 MB — below this, don't bother
-pub const gc_limit_ceiling: u64 = 32 << 30; // 32 GB — cap absolute garbage on big boxes
-
-/// Resolve the collection line: `--gc-budget` if given, else the automatic
-/// `clamp(fraction × MemTotal, floor, ceiling)`. An explicit
-/// value is taken verbatim (including `0` = never collect) — a hard override of
-/// the auto policy; the auto path never returns `0`.
-pub fn memoryBudget(ev: Context) u64 {
-    if (ev.gc_budget_bytes) |b| return b;
-    return autoCollectLine(ev);
+/// Resolve the pacer configuration, or null when collection is disabled
+/// (`--gc-budget=0`). Overrides:
+///   FIX_GC_ARM=SIZE     allocation volume before tracking arms
+///   FIX_GC_GROWTH=PCT   nursery size as a percentage of the old generation
+///   FIX_GC_STEP_MB=N    validation: arm at once and collect every N MiB of
+///                       allocation (wins over `--gc-budget=0`)
+pub fn pacerConfig(ev: Context) ?Pacing.Config {
+    var config: Pacing.Config = .{};
+    if (envSize(ev, "FIX_GC_ARM")) |arm| config.arm_bytes = arm;
+    if (envInt(ev, "FIX_GC_GROWTH")) |pct| config.growth_percent = std.math.cast(u32, pct) orelse config.growth_percent;
+    if (envInt(ev, "FIX_GC_STEP_MB")) |mb| config.step_bytes = mb << 20;
+    if (config.step_bytes > 0) return config;
+    if (ev.gc_budget_bytes) |limit| {
+        if (limit == 0) return null;
+        config.limit_bytes = limit;
+    }
+    return config;
 }
 
-/// Measurement override for keeping precise roots active from evaluation
-/// start. Normal evaluation arms tracking and transient rooting lazily at
-/// `collector.armLineBytes`; `FIX_GC_ROOTS=1` keeps the earlier, more expensive
-/// behavior available for detector and performance comparisons.
-pub fn constrainedMode(ev: Context, budget: u64) bool {
-    // From-start precise rooting costs 2-7% wall on small evals and is
-    // NOT how big evals get their reclaim any more: the lazy path arms
-    // tracking+rooting at `collector.armLineBytes` (budget/4, floored),
-    // so only the sub-arm-line prefix stays pinned. The old heuristic —
-    // constrained iff the budget was EXPLICIT — coupled mechanism to flag
-    // spelling: it taxed every small eval run under `--gc-budget` and
-    // denied ceiling-form users productive collection entirely.
-    // `FIX_GC_ROOTS=1` remains as the measurement/override knob.
-    _ = budget;
+/// Keep precise transient roots from evaluation start so the first major can
+/// reclaim the pre-arming region. Normal evaluation turns rooting on when the
+/// pacer arms; `FIX_GC_ROOTS=1` keeps the earlier, more expensive behavior
+/// available for detector and performance comparisons.
+pub fn rootsFromStart(ev: Context) bool {
     if (ev.env_map) |em| if (em.get("FIX_GC_ROOTS")) |s|
         return !std.mem.eql(u8, s, "0");
     return false;
-}
-
-/// The automatic line: a fraction of physical RAM, clamped. MemTotal (not the
-/// fluctuating MemAvailable) so it's stable and read exactly once. The clamp
-/// bounds default to `gc_limit_floor`/`gc_limit_ceiling`, overridable per run via
-/// `FIX_GC_FLOOR`/`FIX_GC_CEILING`. Fallback: a conservative 4 GiB assumption
-/// when /proc/meminfo is unreadable.
-fn autoCollectLine(ev: Context) u64 {
-    const floor = envSize(ev, "FIX_GC_FLOOR") orelse gc_limit_floor;
-    const ceiling = envSize(ev, "FIX_GC_CEILING") orelse gc_limit_ceiling;
-    return lineFor(systemMemoryTotal() orelse (4 << 30), floor, ceiling);
 }
 
 /// A `SIZE`-syntax env override (same grammar as `--gc-budget`), or null.
@@ -388,72 +355,8 @@ fn envSize(ev: Context, key: []const u8) ?u64 {
     return null;
 }
 
-/// `clamp(fraction × ram, floor, ceiling)` — pure, so the policy is testable.
-/// `@max(floor, ceiling)` guards a floor set above the ceiling.
-fn lineFor(ram: u64, floor: u64, ceiling: u64) u64 {
-    return std.math.clamp(ram / gc_limit_denominator *| gc_limit_numerator, floor, @max(floor, ceiling));
-}
-
-test "auto collection line: fraction of RAM, clamped to [floor, ceiling]" {
-    const f = gc_limit_floor;
-    const c = gc_limit_ceiling;
-    // Floor: tiny boxes don't thrash small evals.
-    try std.testing.expectEqual(f, lineFor(256 << 20, f, c)); // ½·256MB=128MB → floor
-    try std.testing.expectEqual(f, lineFor(512 << 20, f, c)); // ½·512MB=256MB → floor
-    // Mid-range: scales at the fraction.
-    try std.testing.expectEqual(@as(u64, 1 << 30), lineFor(2 << 30, f, c)); // 2GB → 1GB
-    try std.testing.expectEqual(@as(u64, 2 << 30), lineFor(4 << 30, f, c)); // 4GB → 2GB
-    try std.testing.expectEqual(@as(u64, 4 << 30), lineFor(8 << 30, f, c)); // 8GB → 4GB
-    try std.testing.expectEqual(@as(u64, 8 << 30), lineFor(16 << 30, f, c)); // 16GB → 8GB
-    // Ceiling: huge boxes don't sit on absurd garbage.
-    try std.testing.expectEqual(c, lineFor(64 << 30, f, c)); // 64GB → 32GB (cap)
-    try std.testing.expectEqual(c, lineFor(128 << 30, f, c)); // 128GB → 32GB (cap)
-    // Overridden bounds: a raised ceiling lets a big box hold more before GC.
-    try std.testing.expectEqual(@as(u64, 32 << 30), lineFor(64 << 30, f, 64 << 30)); // ½·64=32GB, under raised 64GB cap
-    try std.testing.expectEqual(@as(u64, 64 << 30), lineFor(256 << 30, f, 64 << 30)); // ½·256=128GB → capped at 64GB
-    // A floor set above the ceiling collapses to the floor (guarded).
-    try std.testing.expectEqual(@as(u64, 2 << 30), lineFor(8 << 30, 2 << 30, 1 << 30));
-}
-
-/// Total physical RAM in bytes, or null if the OS query fails (the caller
-/// then assumes a conservative default). Linux reads /proc/meminfo; Darwin
-/// queries the `hw.memsize` sysctl. The `comptime` gates ensure the
-/// libc-only sysctl reference is never codegen'd on non-Darwin targets.
-fn systemMemoryTotal() ?u64 {
-    if (comptime builtin.os.tag == .linux) {
-        var buf: [8192]u8 = undefined;
-        const linux = std.os.linux;
-        const fd_raw = linux.open("/proc/meminfo", .{ .ACCMODE = .RDONLY }, 0);
-        const fd: i32 = @intCast(@as(isize, @bitCast(fd_raw)));
-        if (fd < 0) return null;
-        defer _ = linux.close(fd);
-        const n = linux.read(fd, &buf, buf.len);
-        const rd: isize = @bitCast(n);
-        if (rd <= 0) return null;
-        const text = buf[0..@intCast(rd)];
-        if (meminfoKb(text, "MemTotal:")) |kb| return kb << 10;
-        return null;
-    } else if (comptime builtin.os.tag.isDarwin()) {
-        var val: u64 = 0;
-        var len: usize = @sizeOf(u64);
-        if (std.c.sysctlbyname("hw.memsize", &val, &len, null, 0) == 0 and val != 0) {
-            return val;
-        }
-        return null;
-    } else {
-        return null;
-    }
-}
-
-/// Extract `<key>   <n> kB` from /proc/meminfo text.
-fn meminfoKb(text: []const u8, key: []const u8) ?u64 {
-    var lines = std.mem.tokenizeScalar(u8, text, '\n');
-    while (lines.next()) |line| {
-        if (!std.mem.startsWith(u8, line, key)) continue;
-        var it = std.mem.tokenizeScalar(u8, line[key.len..], ' ');
-        const tok = it.next() orelse return null;
-        return std.fmt.parseInt(u64, tok, 10) catch null;
-    }
+fn envInt(ev: Context, key: []const u8) ?u64 {
+    if (ev.env_map) |em| if (em.get(key)) |s| return std.fmt.parseInt(u64, s, 10) catch null;
     return null;
 }
 
@@ -585,7 +488,7 @@ test "a major roots the pinned pre-arming region (lazy arming)" {
     var heap = try ObjectHeap.init(allocator, 1);
     defer heap.deinit();
     // Lazy budget mode: nothing tracked or rooted until arming.
-    heap_collector.enableBudget(&heap, 64 << 20, false);
+    heap_collector.configure(&heap, .{}, false);
 
     // Pinned parent: a thunk allocated before arming.
     const thunk_id = try heap.addBytecodeThunk(0, &.{});
@@ -640,7 +543,7 @@ test "frame roots closure owner until its raw upvalue slice unwinds" {
     const allocator = std.testing.allocator;
     var heap = try ObjectHeap.init(allocator, 1);
     defer heap.deinit();
-    heap_collector.enableCollect(&heap, 64 << 20, 0);
+    heap_collector.configureEager(&heap, .{});
 
     const captures = [_]Value{
         Value.int(0), Value.int(1), Value.int(2), Value.int(3), Value.int(4),

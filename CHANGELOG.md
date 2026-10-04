@@ -98,6 +98,21 @@ All notable changes to `fix` are documented in this file.
     at 4). Effect order still follows body demand order, so which error
     surfaces first is unchanged.
 
+### Changed
+
+- GC pacing no longer depends on host RAM. The automatic budget of half
+  of `MemTotal` (and `FIX_GC_FLOOR`/`FIX_GC_CEILING`) is replaced by a
+  pacer (`src/runtime/heap/pacer.zig`) clocked by allocation volume.
+  Tracking arms after 1 GiB of allocation. Each nursery is then sized from
+  the heap's own old generation (100%, clamped to 64 MiB–1 GiB), and a major
+  runs once the old generation outgrows the last major's live set. Majors
+  that reclaim little back off. One allocation-volume trigger replaces the
+  reserved-cursor threshold, the post-collect headroom, the object/byte
+  pool-miss triggers, and the object-count major gate.
+  `--gc-budget` is now a soft heap limit (`0` still disables collection),
+  and `FIX_GC_ARM`/`FIX_GC_GROWTH` tune the pacer. `--gc-report` prints the
+  pacer state and the longest minor and major pause.
+
 ### Fixed
 
 - A `let` whose bindings had an eager-elision-eligible RHS chain could

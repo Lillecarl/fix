@@ -239,9 +239,9 @@ pub const Options = struct {
     /// `--compile-cache-dir DIR`: compiled-chunk cache root override
     /// (default `$XDG_CACHE_HOME/fix/chunks`). Borrowed from argv.
     compile_cache_dir: ?[]const u8 = null,
-    /// GC collection-budget override in bytes (`--gc-budget`); see
-    /// `eval/gc_controller.zig:memoryBudget`. `null` = the automatic RAM-scaled line;
-    /// `0` = never collect.
+    /// Soft GC heap limit in bytes (`--gc-budget`); see
+    /// `eval/gc_controller.zig:pacerConfig`. `null` = no limit (the pacer sizes
+    /// the heap from the live set); `0` = never collect.
     gc_budget: ?u64 = null,
     /// `--hugetlb auto|on|off`: back the evaluation heap with explicit 2 MB
     /// huge pages. `null` selects `auto`; resolution happens in
@@ -537,7 +537,7 @@ const specs = [_]Spec{
     .{ .id = .no_color, .long = "--no-color", .help = "disable color diagnostics" },
     .{ .id = .progress, .long = "--progress", .help = "write timestamped progress records", .show_in = eval_cmds },
     .{ .id = .no_progress, .long = "--no-progress", .help = "disable evaluation progress", .show_in = eval_cmds },
-    .{ .id = .gc_budget, .long = "--gc-budget", .arg = .req, .metavar = "SIZE", .help = "override the automatic GC collection budget (MiB,\nor with a k/m/g suffix; 0 = never collect).\nDefault: auto, scaled to RAM.", .completion_help = "set the GC collection budget", .default_value = "auto", .show_in = eval_cmds },
+    .{ .id = .gc_budget, .long = "--gc-budget", .arg = .req, .metavar = "SIZE", .help = "soft limit on the GC-managed heap (MiB, or with\na k/m/g suffix; 0 = never collect).\nDefault: none; the heap is sized from the live set.", .completion_help = "set a soft GC heap limit", .default_value = "none", .show_in = eval_cmds },
     .{ .id = .hugetlb, .long = "--hugetlb", .arg = .req, .metavar = "MODE", .help = "back the evaluation heap with 2 MB huge pages: auto,\non, off (default auto = only when the kernel pool\nhas capacity; provision via vm.nr_hugepages)", .completion_help = "configure 2 MB huge pages", .default_value = "auto", .show_in = eval_cmds, .complete = .{ .hugetlb, .none } },
     .{ .id = .timeline, .long = "--timeline", .arg = .opt, .metavar = "PATH", .help = "write a Perfetto timeline to PATH\n(default: fix-timeline.json)", .completion_help = "write a Perfetto timeline", .default_value = "fix-timeline.json", .show_in = timeline_cmds, .complete = .{ .file, .none } },
     .{ .id = .timeline_flows, .long = "--timeline-flows", .arg = .req, .metavar = "off|all", .help = "record all scheduler steal flows or none\n(default: all)", .completion_help = "record scheduler steal flows", .default_value = "all", .show_in = timeline_cmds, .complete = .{ .timeline_flows, .none } },
@@ -1234,7 +1234,7 @@ test "option completions expose argument shapes defaults and concise help" {
     try std.testing.expect(std.mem.indexOf(u8, completions, "--arg\t--arg NAME EXPR\tpass EXPR") != null);
     try std.testing.expect(std.mem.indexOf(u8, completions, "--color\t--color[=WHEN] [default: auto]\tcolor diagnostics") != null);
     try std.testing.expect(std.mem.indexOf(u8, completions, "--expr\t--expr EXPR [repeatable]\tevaluate expression text") != null);
-    try std.testing.expect(std.mem.indexOf(u8, completions, "--gc-budget\t--gc-budget SIZE [default: auto]\tset the GC collection budget") != null);
+    try std.testing.expect(std.mem.indexOf(u8, completions, "--gc-budget\t--gc-budget SIZE [default: none]\tset a soft GC heap limit") != null);
     try std.testing.expect(std.mem.indexOf(u8, completions, "--timeline\t--timeline[=PATH] [default: fix-timeline.json]\twrite a Perfetto timeline") != null);
 }
 

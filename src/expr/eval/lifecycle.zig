@@ -50,7 +50,7 @@ fn destroy(engine: anytype) void {
     );
     gc.recordFinalTotal(&engine.heap.collection.report, engine.heap.totalReservedBytes());
     if (engine.collection.report_on)
-        gc.report(&engine.heap.collection.report, engine.heap.collection.budget_bytes);
+        gc.report(&engine.heap.collection.report, &engine.heap.collection.pacer);
 
     // Workers must quiesce before any state borrowed by their VMs is freed.
     engine.execution.scheduler.deinit();

@@ -2901,27 +2901,16 @@ pub const Engine = struct {
                     if (c >= 1) self.collection.parallel_cap = c;
                 } else |_| {}
             };
-        // FIX_GC_STEP_MB (validation): collect every N MB of fresh
-        // allocation so the detector exercises every builtin loop.
-        var step_bytes: u64 = 0;
-        if (self.sources.env_map) |em| {
-            if (em.get("FIX_GC_STEP_MB")) |s| {
-                if (std.fmt.parseInt(u64, s, 10)) |mb| step_bytes = mb << 20 else |_| {}
-            }
+        // Collection policy: the pacer arms tracking after a fixed allocation
+        // volume and then sizes each nursery from the heap's own old
+        // generation (see `gc_controller.pacerConfig`). `--gc-budget=0`
+        // disables collection (bump-only); FIX_GC_STEP_MB arms eagerly.
+        if (gc_controller.pacerConfig(gcContext(self))) |config| {
+            if (config.step_bytes > 0)
+                heap_collector.configureEager(&self.heap, config)
+            else
+                heap_collector.configure(&self.heap, config, gc_controller.rootsFromStart(gcContext(self)));
         }
-        // Collection line: no collection runs until heap-reserved bytes
-        // cross it (automatic `clamp(½·MemTotal, 256MB, 32GB)`, overridable
-        // via `--gc-budget`; see `gc_controller.memoryBudget`).
-        // On a roomy machine that line dwarfs the eval → never fires: zero
-        // pauses AND zero tracking (lazy arming at line/2, see
-        // `heap_collector.enableBudget`); on a tight machine it fires before the
-        // eval OOMs. Override 0 = never collect (bump-only). FIX_GC_STEP_MB
-        // keeps the eager validation path (tracking from the start).
-        const budget = gc_controller.memoryBudget(gcContext(self));
-        if (step_bytes > 0)
-            heap_collector.enableCollect(&self.heap, budget, step_bytes)
-        else if (budget > 0)
-            heap_collector.enableBudget(&self.heap, budget, gc_controller.constrainedMode(gcContext(self), budget));
         return w;
     }
 
@@ -2995,7 +2984,7 @@ pub const Engine = struct {
     /// any evaluation — the repl's between-inputs reclaim. Drives the same
     /// barrier + hook sequence as the in-eval safepoint (vm/force.zig): win
     /// the collector race, park every worker, collect, release. The first
-    /// call arms reclaim tracking (`armLazy` — everything already allocated
+    /// call arms reclaim tracking (`collector.arm` — everything already allocated
     /// becomes the untracked old floor); later calls run real minors.
     ///
     /// Callable only between evaluations (no fiber may be mid-flight on the
@@ -3005,7 +2994,7 @@ pub const Engine = struct {
         // No hook yet (nothing evaluated) or reclaim disabled by policy
         // (threshold never armed): nothing to do.
         if (self.execution.main_worker == null) return result;
-        if (self.heap.collection.threshold_bytes == std.math.maxInt(u64)) return result;
+        if (self.heap.collection.pacer.isDisabled()) return result;
         if (!self.execution.scheduler.gcTryBeginCollection()) return result;
         const before = gc.liveReport(&self.heap.collection.report);
         self.execution.scheduler.gcWaitAllParked(0);
@@ -3032,7 +3021,7 @@ pub const Engine = struct {
     pub fn collectMajorNow(self: *Engine) CollectNowResult {
         var result = self.collectNowResult();
         if (self.execution.main_worker == null) return result;
-        if (self.heap.collection.threshold_bytes == std.math.maxInt(u64)) return result;
+        if (self.heap.collection.pacer.isDisabled()) return result;
         if (!self.execution.scheduler.gcTryBeginCollection()) return result;
         const before = gc.liveReport(&self.heap.collection.report);
         self.execution.scheduler.gcWaitAllParked(0);
@@ -3051,7 +3040,7 @@ pub const Engine = struct {
     fn collectMajorAtSafepoint(self: *Engine, collector_id: u8) CollectNowResult {
         var result = self.collectNowResult();
         if (self.execution.main_worker == null) return result;
-        if (self.heap.collection.threshold_bytes == std.math.maxInt(u64)) return result;
+        if (self.heap.collection.pacer.isDisabled()) return result;
         if (!self.execution.scheduler.gcTryBeginCollection()) return result;
         const before = gc.liveReport(&self.heap.collection.report);
         self.execution.scheduler.gcWaitAllParked(collector_id);
