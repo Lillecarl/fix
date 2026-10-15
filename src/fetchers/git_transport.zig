@@ -72,6 +72,7 @@ pub fn snapshotLocal(
     repository_path: []const u8,
     destination: []const u8,
     rev: ?[]const u8,
+    ref_name: ?[]const u8,
     submodules: bool,
     shallow: bool,
 ) !Result {
@@ -85,12 +86,14 @@ pub fn snapshotLocal(
     var repo = discoverRepository(allocator, io, source_dir, &diag) catch |err| return mapError(err);
     defer repo.deinit();
 
-    const target = resolveObject(allocator, &repo, rev, null, &diag) catch |err| return err;
+    const target = resolveObject(allocator, &repo, rev, ref_name, &diag) catch |err| return err;
     const commit_oid = ziggit.peel(allocator, &repo, target, .commit) catch |err| return mapError(err);
     const commit_info = try readCommitInfo(allocator, &repo, commit_oid, &diag);
 
     try std.Io.Dir.cwd().createDirPath(io, destination);
-    if (rev != null) {
+    // A pinned rev or ref exports the named commit's tree; only an unpinned
+    // request snapshots the (possibly dirty) working tree, as Nix does.
+    if (rev != null or ref_name != null) {
         try exportCommit(allocator, io, &repo, commit_info.tree, repository_path, destination, submodules, &diag);
     } else {
         try copyTrackedWorktree(allocator, io, &repo, repository_path, destination, submodules);
@@ -929,7 +932,7 @@ test "shallow snapshots skip revCount; a truncated history reports the sentinel"
 
     const full_dest = try std.fs.path.join(testing.allocator, &.{ root, "full" });
     defer testing.allocator.free(full_dest);
-    const full = try snapshotLocal(testing.allocator, testing.io, source, full_dest, null, false, false);
+    const full = try snapshotLocal(testing.allocator, testing.io, source, full_dest, null, null, false, false);
     try testing.expectEqual(@as(i64, 1), full.rev_count);
     // Proves `copyTrackedWorktree` ran. Without this the whole test passes
     // against a snapshot that copied nothing, which it did while ziggit had
@@ -938,7 +941,7 @@ test "shallow snapshots skip revCount; a truncated history reports the sentinel"
 
     const shallow_dest = try std.fs.path.join(testing.allocator, &.{ root, "shallow" });
     defer testing.allocator.free(shallow_dest);
-    const shallow = try snapshotLocal(testing.allocator, testing.io, source, shallow_dest, null, false, true);
+    const shallow = try snapshotLocal(testing.allocator, testing.io, source, shallow_dest, null, null, false, true);
     try testing.expectEqual(@as(i64, 0), shallow.rev_count);
     try testing.expectEqualStrings(&full.rev, &shallow.rev);
 
@@ -948,11 +951,11 @@ test "shallow snapshots skip revCount; a truncated history reports the sentinel"
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "source/.git/shallow", .data = shallow_marker });
     const truncated_dest = try std.fs.path.join(testing.allocator, &.{ root, "truncated" });
     defer testing.allocator.free(truncated_dest);
-    const truncated = try snapshotLocal(testing.allocator, testing.io, source, truncated_dest, null, false, false);
+    const truncated = try snapshotLocal(testing.allocator, testing.io, source, truncated_dest, null, null, false, false);
     try testing.expectEqual(@as(i64, -1), truncated.rev_count);
     const allowed_dest = try std.fs.path.join(testing.allocator, &.{ root, "allowed" });
     defer testing.allocator.free(allowed_dest);
-    const allowed = try snapshotLocal(testing.allocator, testing.io, source, allowed_dest, null, false, true);
+    const allowed = try snapshotLocal(testing.allocator, testing.io, source, allowed_dest, null, null, false, true);
     try testing.expectEqual(@as(i64, 0), allowed.rev_count);
 }
 
@@ -1058,7 +1061,7 @@ test "an unpinned snapshot keeps dirty tracked edits and excludes untracked file
 
     const dest = try std.fs.path.join(testing.allocator, &.{ root, "snapshot" });
     defer testing.allocator.free(dest);
-    _ = try snapshotLocal(testing.allocator, testing.io, source, dest, null, false, false);
+    _ = try snapshotLocal(testing.allocator, testing.io, source, dest, null, null, false, false);
 
     try expectSnapshotFile(testing.allocator, testing.io, dest, "tracked", "dirty");
 
