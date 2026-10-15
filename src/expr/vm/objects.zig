@@ -70,9 +70,15 @@ pub fn buildList(self: *VM, count: u16) !void {
 }
 
 pub fn mergeAttrs(self: *VM, left: Value, right: Value) !Value {
-    if (!left.isAttrs()) return trace.typeErrorExpected(self, "attrs", left);
-    if (!right.isAttrs()) return trace.typeErrorExpected(self, "attrs", right);
-    return Value.attrs(try self.heap.mergeAttrsLayered(left.asObjectId(), right.asObjectId()));
+    // `//` is strict in both operands: force them here rather than assuming the
+    // compiler already did. A call operand (e.g. a folded accumulator) can
+    // reach the opcode as a thunk, and `mergeAttrLiteralValue` already forces
+    // for the same reason.
+    const l = try force.forceValue(self, left);
+    const r = try force.forceValue(self, right);
+    if (!l.isAttrs()) return trace.typeErrorExpected(self, "attrs", l);
+    if (!r.isAttrs()) return trace.typeErrorExpected(self, "attrs", r);
+    return Value.attrs(try self.heap.mergeAttrsLayered(l.asObjectId(), r.asObjectId()));
 }
 
 pub fn mergeAttrsStrict(self: *VM, left: Value, right: Value) !Value {
