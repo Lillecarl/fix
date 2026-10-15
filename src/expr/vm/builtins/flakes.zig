@@ -67,6 +67,8 @@ pub fn builtinFetchTreeEntry(self: *VM, arg: Value) !Value {
             forced;
         try purity.enforceFetchLocked(self, purity.attrsHaveLock(self, ref_attrs));
     }
+    const forced_arg = try vm_force.forceValue(self, arg);
+    if (forced_arg.isAttrs()) try fetch.validateTreeInput(self, forced_arg.asObjectId());
     const value = try fetchTreeImpl(self, arg, true);
     try fetch.verifyResultNarHash(self, arg, value);
     return value;

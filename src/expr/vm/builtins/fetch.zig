@@ -495,8 +495,7 @@ fn validateFetchedSha256(self: *VM, noun: []const u8, url: []const u8, expected_
 /// fetched tree, so a lock's integrity hash is enforced. The result's own
 /// `narHash` is read through `optionalStringAttr`, which forces the lazy hash
 /// when plain eval deferred it.
-pub fn verifyResultNarHash(self: *VM, arg: Value, value: Value) !void {
-    const attrs = try vm_force.forceValue(self, arg);
+pub fn verifyResultNarHash(self: *VM, arg: Value, value: Value) !void {    const attrs = try vm_force.forceValue(self, arg);
     if (!attrs.isAttrs()) return;
     const expected_opt = try optionalStringAttr(self, attrs.asObjectId(), "narHash");
     const expected = expected_opt orelse return;
@@ -529,6 +528,63 @@ pub fn verifyResultNarHash(self: *VM, arg: Value, value: Value) !void {
     defer self.allocator.free(message);
     try vm_trace.setErrorMessage(self, message);
     return error.HashMismatch;
+}
+
+/// Nix validates a `fetchTree` argument's attribute set per scheme: an unknown
+/// or misplaced key is rejected with `input attribute 'X' not supported by
+/// scheme 'Y'`, and a `narHash` must be SRI. `name` is left to the caller's
+/// argument-schema check (its message differs). Schemes fix supports beyond Nix
+/// (mercurial) are skipped.
+pub fn validateTreeInput(self: *VM, attrs_id: ObjectId) !void {
+    const type_value = try optionalStringAttr(self, attrs_id, "type") orelse return;
+    defer self.allocator.free(type_value);
+    const allowed: []const []const u8 =
+        if (std.mem.eql(u8, type_value, "path"))
+            &.{ "type", "path", "narHash", "rev", "lastModified", "revCount" }
+        else if (std.mem.eql(u8, type_value, "file") or std.mem.eql(u8, type_value, "tarball"))
+            &.{ "type", "url", "narHash", "rev", "lastModified", "revCount" }
+        else if (std.mem.eql(u8, type_value, "git"))
+            &.{ "type", "url", "ref", "rev", "narHash", "submodules", "allRefs", "shallow", "lastModified", "revCount" }
+        else if (std.mem.eql(u8, type_value, "github") or std.mem.eql(u8, type_value, "gitlab") or std.mem.eql(u8, type_value, "sourcehut"))
+            &.{ "type", "owner", "repo", "host", "ref", "rev", "narHash", "lastModified" }
+        else
+            return;
+    const entries = try self.heap.materializeAttrs(attrs_id);
+    outer: for (entries.names) |entry_name| {
+        const name = self.intern.get(entry_name);
+        if (std.mem.eql(u8, name, "name")) continue;
+        for (allowed) |a| if (std.mem.eql(u8, name, a)) continue :outer;
+        const message = try std.fmt.allocPrint(self.allocator, "input attribute '{s}' not supported by scheme '{s}'", .{ name, type_value });
+        defer self.allocator.free(message);
+        try vm_trace.setErrorMessage(self, message);
+        return error.UnexpectedArgument;
+    }
+    if (try optionalStringAttr(self, attrs_id, "narHash")) |expected_nar| {
+        defer self.allocator.free(expected_nar);
+        if (isSri(expected_nar)) return;
+        const message = try std.fmt.allocPrint(self.allocator, "hash '{s}' is not SRI", .{expected_nar});
+        defer self.allocator.free(message);
+        try vm_trace.setErrorMessage(self, message);
+        return error.InvalidHash;
+    }
+}
+
+/// Whether `text` is an SRI hash (`<algo>-<base64>`): the decoded body must be
+/// the algorithm's digest length, so a bare 64-char hex digest is not SRI.
+fn isSri(text: []const u8) bool {
+    const dash = std.mem.indexOfScalar(u8, text, '-') orelse return false;
+    const want: usize = if (std.mem.eql(u8, text[0..dash], "sha256"))
+        32
+    else if (std.mem.eql(u8, text[0..dash], "sha512"))
+        64
+    else if (std.mem.eql(u8, text[0..dash], "sha1"))
+        20
+    else if (std.mem.eql(u8, text[0..dash], "md5"))
+        16
+    else
+        return false;
+    const size = std.base64.standard.Decoder.calcSizeForSlice(text[dash + 1 ..]) catch return false;
+    return size == want;
 }
 
 /// Realize a fetched single file to its flat (`fixed:sha256`) fixed-output
