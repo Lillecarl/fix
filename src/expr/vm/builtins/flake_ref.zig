@@ -76,7 +76,19 @@ pub fn parse(self: *VM, arg: Value) !Value {
         try appendQueryAttrs(self, &entries, query);
         return Value.attrs(try self.heap.addAttrs(entries.items));
     }
+    if (std.mem.startsWith(u8, base, "file+")) {
+        try appendStringAttr(self, &entries, "type", "file");
+        try appendStringAttr(self, &entries, "url", base["file+".len..]);
+        try appendQueryAttrs(self, &entries, query);
+        return Value.attrs(try self.heap.addAttrs(entries.items));
+    }
     if (std.mem.startsWith(u8, base, "http://") or std.mem.startsWith(u8, base, "https://")) {
+        try appendStringAttr(self, &entries, "type", "tarball");
+        try appendStringAttr(self, &entries, "url", base);
+        try appendQueryAttrs(self, &entries, query);
+        return Value.attrs(try self.heap.addAttrs(entries.items));
+    }
+    if (std.mem.startsWith(u8, base, "file://")) {
         try appendStringAttr(self, &entries, "type", "tarball");
         try appendStringAttr(self, &entries, "url", base);
         try appendQueryAttrs(self, &entries, query);
@@ -208,9 +220,22 @@ fn appendQueryAttrs(self: *VM, entries: *std.ArrayListUnmanaged(heap_mod.AttrEnt
                 break;
             }
         }
-        inline for (.{ "ref", "rev", "narHash", "dir", "host", "lastModified", "revCount" }) |known| {
+        inline for (.{ "ref", "rev", "narHash", "dir", "host" }) |known| {
             if (std.mem.eql(u8, key, known)) {
                 try appendStringAttr(self, entries, key, value);
+                break;
+            }
+        }
+        // `lastModified`/`revCount` are integers in Nix. Leaving them strings
+        // made them a type error where `fetchTree`/`getFlake` read them with an
+        // int-typed lookup, and diverged from Nix's parsed value.
+        inline for (.{ "lastModified", "revCount" }) |known| {
+            if (std.mem.eql(u8, key, known)) {
+                const number = std.fmt.parseInt(i64, value, 10) catch return error.InvalidFlakeRef;
+                try entries.append(self.allocator, .{
+                    .name = try self.intern.intern(key),
+                    .value = Value.int(number),
+                });
                 break;
             }
         }
