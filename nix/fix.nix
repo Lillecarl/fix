@@ -38,8 +38,34 @@ stdenv.mkDerivation (finalAttrs: {
     hash = "sha256-Pn++iuvuuqwRQJ+0dHQXJZx4QliNfUzh49wdhukNvgc=";
   };
 
+  # ziggit's fetcher refuses an object-id refspec when the server does not
+  # advertise `allow-*-sha1-in-want`, though hosts like GitHub serve the want
+  # anyway (`git fetch <url> <oid>` works). A lock that pins an
+  # out-of-advertisement git revision (e.g. an npins source behind a moved
+  # branch) then cannot be fetched. Patch the fetched ziggit source and resolve
+  # it as a local path dependency — Zig verifies a URL dependency's content
+  # hash against the manifest, so a patched tarball cannot keep the pinned
+  # hash, and path dependencies carry none. `zigDeps` (which ran `zig build
+  # --fetch` against the untouched store `src`) still supplies every other dep.
   postConfigure = ''
-    ln -s $zigDeps $ZIG_GLOBAL_CACHE_DIR/p
+    work=$NIX_BUILD_TOP/ziggit-src
+    mkdir -p "$work" vendor
+    tar xzf "$zigDeps"/ziggit-*.tar.gz -C "$work"
+    chmod -R u+w "$work"
+    mv "$work"/ziggit-* vendor/ziggit
+    patch -d vendor/ziggit -p1 < ${./patches/ziggit-oid-want.patch}
+    sed -i 's|\.url = "git+[^"]*ziggit[^"]*",|.path = "vendor/ziggit",|' build.zig.zon
+    sed -i '\|\.hash = "ziggit-|d' build.zig.zon
+
+    deps=$NIX_BUILD_TOP/zig-deps
+    mkdir -p "$deps"
+    for f in "$zigDeps"/*; do
+      case "$(basename "$f")" in
+        ziggit-*.tar.gz) ;;
+        *) ln -s "$f" "$deps/$(basename "$f")" ;;
+      esac
+    done
+    ln -s "$deps" "$ZIG_GLOBAL_CACHE_DIR/p"
   '';
 
   nativeBuildInputs = [

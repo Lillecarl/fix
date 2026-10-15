@@ -1,0 +1,21 @@
+--- a/lib/ziggit-fetch/Fetcher.zig
++++ b/lib/ziggit-fetch/Fetcher.zig
+@@ -171,13 +171,11 @@
+     defer caps.deinit(gpa);
+     if (!caps.isV2()) return error.UnsupportedProtocol;
+ 
+-    for (options.refspecs) |rs| {
+-        if (remote_mod.isObjectId(repo.format, rs.src)) {
+-            const has_tip = caps.has("allow-tip-sha1-in-want");
+-            const has_reachable = caps.has("allow-reachable-sha1-in-want");
+-            if (!has_tip and !has_reachable) return error.ServerRefusesOidWant;
+-        }
+-    }
++    // An object-id refspec (`git fetch <url> <oid>`) is served by hosts that do
++    // not advertise `allow-*-sha1-in-want` — GitHub and others honor it, as
++    // `git fetch <url> <oid>` shows — so attempt it and let the server answer
++    // rather than refusing pre-emptively. The caller falls back to a named ref
++    // if the want is genuinely rejected.
+ 
+     const listing = try lsRefs(gpa, repo.format, t, options.refspecs, diag);
+     defer {
