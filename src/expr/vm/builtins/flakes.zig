@@ -67,7 +67,9 @@ pub fn builtinFetchTreeEntry(self: *VM, arg: Value) !Value {
             forced;
         try purity.enforceFetchLocked(self, purity.attrsHaveLock(self, ref_attrs));
     }
-    return fetchTreeImpl(self, arg, true);
+    const value = try fetchTreeImpl(self, arg, true);
+    try fetch.verifyResultNarHash(self, arg, value);
+    return value;
 }
 
 /// A path that is already a valid store-path root is used verbatim, as
@@ -107,6 +109,15 @@ fn fetchTreeImpl(self: *VM, arg: Value, fetch_tree_defaults: bool) !Value {
     }
     if (!attrs.isAttrs()) return error.TypeError;
 
+    // Nix's fetchTree validates its schema and rejects a caller-supplied
+    // `name` (unlike fetchurl/fetchTarball): the result's store name is
+    // derived from the input type.
+    if (try optionalStringAttr(self, attrs.asObjectId(), "name")) |name| {
+        self.allocator.free(name);
+        try vm_trace.setErrorMessage(self, "argument 'name' isn't supported in call to 'fetchTree'");
+        return error.UnexpectedArgument;
+    }
+
     // Nix resolves a locked `narHash` to its store path without fetching, for
     // every input type (fetchers.cc `isFinal()`), so an input already in the
     // store is served from there. `builtins.fetchTree` must do the same, not
@@ -136,19 +147,21 @@ fn fetchTreeImpl(self: *VM, arg: Value, fetch_tree_defaults: bool) !Value {
         const locked_hash = try optionalStringAttr(self, attrs_id, "narHash");
         defer if (locked_hash) |h| self.allocator.free(h);
         if (try adoptStorePath(self, path, locked_hash, last_modified)) |adopted| return adopted;
-        const out = try ingestFetchedTree(self, path, path_ops.baseName(path), "", null);
+        const out = try ingestFetchedTree(self, path, "source", "", null);
         defer out.deinit(self.allocator);
         return pathTreeValue(self, out.out_path, out.nar_hash, last_modified);
     }
 
     if (std.mem.eql(u8, type_value, "file")) {
-        const spec = try fetchUrlSpecFromAttrs(self, attrs_id, null);
+        const spec = try fetchUrlSpecFromAttrs(self, attrs_id, "source");
         defer spec.deinit(self.allocator);
         const result = try offloadFetch(self, .url, spec.borrowed());
         defer result.deinit(self.fetchers.allocator);
-        const path = try flatFetchOutPath(self, result.path, result.hash, spec.name);
-        defer self.allocator.free(path);
-        return fileTreeValue(self, path, result.hash);
+        // Nix's file fetcher ingests the download recursively — a NAR source
+        // tree named "source" (`fixed:r:sha256`), not a flat fixed-output file.
+        const out = try ingestFetchedTree(self, result.path, spec.name, "", null);
+        defer out.deinit(self.allocator);
+        return fileTreeValue(self, out.out_path, out.nar_hash);
     }
 
     if (std.mem.eql(u8, type_value, "tarball")) {

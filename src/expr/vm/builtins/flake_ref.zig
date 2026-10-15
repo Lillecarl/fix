@@ -163,13 +163,37 @@ pub fn render(self: *VM, arg: Value) !Value {
     return error.InvalidFlakeRef;
 }
 
+/// Percent-decode a flake-ref query value, as Nix does: `?narHash=…%3D` must
+/// compare equal to a plain `…=`, not keep the escape. `+` is left alone
+/// (SRI base64 uses it).
+fn percentDecoded(self: *VM, text: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(self.allocator);
+    var i: usize = 0;
+    while (i < text.len) {
+        const hex = if (text[i] == '%' and i + 2 < text.len)
+            std.fmt.parseUnsigned(u8, text[i + 1 .. i + 3], 16) catch null
+        else
+            null;
+        if (hex) |byte| {
+            try out.append(self.allocator, byte);
+            i += 3;
+        } else {
+            try out.append(self.allocator, text[i]);
+            i += 1;
+        }
+    }
+    return out.toOwnedSlice(self.allocator);
+}
+
 fn appendQueryAttrs(self: *VM, entries: *std.ArrayListUnmanaged(heap_mod.AttrEntry), query: []const u8) !void {
     var parts = std.mem.splitScalar(u8, query, '&');
     while (parts.next()) |part| {
         if (part.len == 0) continue;
         const separator = std.mem.indexOfScalar(u8, part, '=') orelse continue;
         const key = part[0..separator];
-        const value = part[separator + 1 ..];
+        const value = try percentDecoded(self, part[separator + 1 ..]);
+        defer self.allocator.free(value);
         // Nix types the git flags as booleans: `?shallow=1` and `?submodules=1`
         // parse to `true`, and every other spelling to `false`. `fetchTree`
         // reads them with a bool-typed attribute lookup, so leaving them as

@@ -490,6 +490,47 @@ fn validateFetchedSha256(self: *VM, noun: []const u8, url: []const u8, expected_
     return error.HashMismatch;
 }
 
+/// Nix verifies a `fetchTree` result against the `narHash` its argument
+/// supplied (SRI or hex) and fails on a mismatch rather than silently using the
+/// fetched tree, so a lock's integrity hash is enforced. The result's own
+/// `narHash` is read through `optionalStringAttr`, which forces the lazy hash
+/// when plain eval deferred it.
+pub fn verifyResultNarHash(self: *VM, arg: Value, value: Value) !void {
+    const attrs = try vm_force.forceValue(self, arg);
+    if (!attrs.isAttrs()) return;
+    const expected_opt = try optionalStringAttr(self, attrs.asObjectId(), "narHash");
+    const expected = expected_opt orelse return;
+    defer self.allocator.free(expected);
+    const result = try vm_force.forceValue(self, value);
+    if (!result.isAttrs()) return;
+    const actual_opt = try optionalStringAttr(self, result.asObjectId(), "narHash");
+    const actual = actual_opt orelse return;
+    defer self.allocator.free(actual);
+    const want_hex = derivation.hashToBase16(self.allocator, "sha256", expected) catch {
+        const message = try std.fmt.allocPrint(self.allocator, "invalid narHash '{s}'", .{expected});
+        defer self.allocator.free(message);
+        try vm_trace.setErrorMessage(self, message);
+        return error.InvalidHash;
+    };
+    defer self.allocator.free(want_hex);
+    const got_hex = derivation.hashToBase16(self.allocator, "sha256", actual) catch {
+        const message = try std.fmt.allocPrint(self.allocator, "invalid narHash '{s}'", .{actual});
+        defer self.allocator.free(message);
+        try vm_trace.setErrorMessage(self, message);
+        return error.InvalidHash;
+    };
+    defer self.allocator.free(got_hex);
+    if (std.ascii.eqlIgnoreCase(want_hex, got_hex)) return;
+    const message = try std.fmt.allocPrint(
+        self.allocator,
+        "NAR hash mismatch: expected '{s}' but got '{s}'",
+        .{ expected, actual },
+    );
+    defer self.allocator.free(message);
+    try vm_trace.setErrorMessage(self, message);
+    return error.HashMismatch;
+}
+
 /// Realize a fetched single file to its flat (`fixed:sha256`) fixed-output
 /// store path — like Nix's fetchurl. Under store writes the bytes are added to
 /// the real store; in plain eval the store path is still returned, with the
