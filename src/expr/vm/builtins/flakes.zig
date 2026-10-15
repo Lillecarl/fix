@@ -74,21 +74,6 @@ pub fn builtinFetchTreeEntry(self: *VM, arg: Value) !Value {
     return value;
 }
 
-/// A path that is already a valid store-path root is used verbatim, as
-/// Nix's path fetcher does.
-fn adoptStorePath(self: *VM, path: []const u8, locked_nar_hash: ?[]const u8, last_modified: i64) !?Value {
-    const store_dir = self.realization.store_dir;
-    if (!std.mem.startsWith(u8, path, store_dir)) return null;
-    if (path.len <= store_dir.len + 1 or path[store_dir.len] != '/') return null;
-    const rest = path[store_dir.len + 1 ..];
-    if (rest.len == 0 or std.mem.indexOfScalar(u8, rest, '/') != null) return null;
-    if (self.realization.storeWritesEnabled()) {
-        // A store-shaped name the daemon doesn't know is just a directory.
-        if (!try self.realization.pathIsValid(path)) return null;
-    }
-    return try pathTreeValue(self, path, locked_nar_hash orelse "", last_modified);
-}
-
 pub fn builtinFetchTree(self: *VM, arg: Value) !Value {
     return fetchTreeImpl(self, arg, false);
 }
@@ -100,8 +85,7 @@ fn fetchTreeImpl(self: *VM, arg: Value, fetch_tree_defaults: bool) !Value {
     const attrs = try vm_force.forceValue(self, arg);
     if (attrs.isPath()) {
         const path = self.intern.get(attrs.asInternId());
-        if (try adoptStorePath(self, path, null, fetch.sourceLastModified(self, path))) |adopted| return adopted;
-        const out = try ingestFetchedTree(self, path, path_ops.baseName(path), "", null);
+        const out = try ingestFetchedTree(self, path, "source", "", null);
         defer out.deinit(self.allocator);
         return pathTreeValue(self, out.out_path, out.nar_hash, fetch.sourceLastModified(self, path));
     }
@@ -143,12 +127,11 @@ fn fetchTreeImpl(self: *VM, arg: Value, fetch_tree_defaults: bool) !Value {
     if (std.mem.eql(u8, type_value, "path")) {
         const path = try dupPathAttr(self, attrs_id, "path");
         defer self.allocator.free(path);
-        // A locked pin wins (deterministic across hosts); a bare local path
-        // reports the tree's own mtime, as Nix's path fetcher does.
+        // Nix's path fetcher ingests the tree under the derived name "source":
+        // a store-path input that is not already `<content>-source` is
+        // re-ingested, not adopted verbatim. A locked pin wins for the
+        // timestamp; a bare local path reports the tree's own mtime.
         const last_modified = (try optionalIntAttr(self, attrs_id, "lastModified")) orelse fetch.sourceLastModified(self, path);
-        const locked_hash = try optionalStringAttr(self, attrs_id, "narHash");
-        defer if (locked_hash) |h| self.allocator.free(h);
-        if (try adoptStorePath(self, path, locked_hash, last_modified)) |adopted| return adopted;
         const out = try ingestFetchedTree(self, path, "source", "", null);
         defer out.deinit(self.allocator);
         return pathTreeValue(self, out.out_path, out.nar_hash, last_modified);
@@ -1167,16 +1150,12 @@ fn flakeInputFromStore(self: *VM, attrs: Value) !?Value {
     // The store-path name must match what the fetch would use (see builtinFetchTree).
     const path_attr = if (is_path) (try optionalStringAttr(self, id, "path")) else null;
     defer if (path_attr) |p| self.allocator.free(p);
-    if (path_attr) |p| {
-        const lm = (try optionalIntAttr(self, id, "lastModified")) orelse 0;
-        if (try adoptStorePath(self, p, nar_hash, lm)) |adopted| return adopted;
-    }
+    if (is_path and path_attr == null) return null;
     const name_attr = if (!is_path) (try optionalStringAttr(self, id, "name")) else null;
     defer if (name_attr) |n| self.allocator.free(n);
-    const name = if (is_path)
-        (if (path_attr) |p| path_ops.baseName(p) else return null)
-    else
-        (name_attr orelse "source");
+    // Nix's path fetcher derives "source", so the locked narHash alone names
+    // the store path (a store-path input is not adopted verbatim).
+    const name = if (is_path) "source" else (name_attr orelse "source");
 
     const hex = derivation.hashToBase16(self.allocator, "sha256", nar_hash) catch return null;
     defer self.allocator.free(hex);

@@ -164,17 +164,21 @@ out=$("$FIX" eval --json --read-write-mode -E "
   in builtins.attrNames (builtins.readDir (src + \"/sub\"))" 2>&1)
 t "daemon: readDir of a fresh tree subpath materializes the root" "leaf.txt" "$out"
 
-# A `path:` fetch of an existing store path returns it verbatim, as Nix does.
+# A `path:` fetch ingests the tree under the derived name "source", as Nix
+# does: a store path whose basename is not "source" is not adopted verbatim.
 adopt_dir=$(e2e_mktemp)
 mkdir -p "$adopt_dir/tree"
 printf 'adopt-me' >"$adopt_dir/tree/inner.txt"
 out=$("$FIX" eval --raw --read-write-mode --impure \
     --extra-experimental-features fetch-tree -E "
   let a = toString (builtins.path { path = $adopt_dir/tree; name = \"fix-daemon-e2e-adopt\"; });
+      r = builtins.fetchTree { type = \"path\"; path = a; };
   in builtins.seq (builtins.pathExists a)
-    (if (builtins.fetchTree { type = \"path\"; path = a; }).outPath == a
-     then \"adopted-verbatim\" else \"re-ingested\")" 2>&1)
-t "daemon: fetchTree adopts an existing store path verbatim" "adopted-verbatim" "$out"
+    (if r.outPath == a then \"adopted-verbatim\"
+     else if builtins.substring (builtins.stringLength r.outPath - 7) 7 r.outPath == \"-source\"
+       then \"re-ingested-source\"
+       else \"unexpected: \${r.outPath}\")" 2>&1)
+t "daemon: fetchTree re-ingests a store-path input under 'source'" "re-ingested-source" "$out"
 
 # AddIndirectRoot's dummy result must be consumed so the connection stays
 # usable for the next operation.
