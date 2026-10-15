@@ -196,13 +196,18 @@ const Parser = struct {
     }
 
     fn parseRepeat(self: *Parser) anyerror!*Node {
-        const atom = try self.parseAtom();
-        const repeat = try self.parseRepeatSuffix() orelse return atom;
-        return self.node(.{
-            .tag = .repeat,
-            .child = atom,
-            .repeat = repeat,
-        });
+        var expr = try self.parseAtom();
+        // POSIX ERE allows a quantifier on an already-quantified atom
+        // (`a**`, `a+?`, `a{2}*`): each applies to the running expression, as
+        // std::regex accepts.
+        while (try self.parseRepeatSuffix()) |repeat| {
+            expr = try self.node(.{
+                .tag = .repeat,
+                .child = expr,
+                .repeat = repeat,
+            });
+        }
+        return expr;
     }
 
     fn parseRepeatSuffix(self: *Parser) anyerror!?Repeat {
@@ -272,7 +277,7 @@ const Parser = struct {
             '^' => self.node(.{ .tag = .anchor_start }),
             '$' => self.node(.{ .tag = .anchor_end }),
             '\\' => self.node(.{ .tag = .literal, .literal = try self.escapedByte() }),
-            '*', '+', '?' => error.InvalidRegex,
+            '*', '+', '?', '{' => error.InvalidRegex,
             else => self.node(.{ .tag = .literal, .literal = c }),
         };
     }
@@ -319,10 +324,13 @@ const Parser = struct {
             if (self.peek() == '-' and self.index + 1 < self.source.len and self.source[self.index + 1] != ']') {
                 self.index += 1;
                 const last = try self.classByte();
+                // std::regex rejects a reversed range (`[z-a]`): a bracket
+                // expression range must ascend.
+                if (first > last) return error.InvalidRegex;
                 try items.append(self.allocator, .{
                     .tag = .range,
-                    .range_start = @min(first, last),
-                    .range_end = @max(first, last),
+                    .range_start = first,
+                    .range_end = last,
                 });
             } else {
                 try items.append(self.allocator, .{ .tag = .char, .char = first });
