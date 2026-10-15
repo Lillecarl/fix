@@ -112,10 +112,16 @@ const Repeat = struct {
 const PosixClass = enum {
     alnum,
     alpha,
+    blank,
+    cntrl,
     digit,
-    space,
+    graph,
     lower,
+    print,
+    punct,
+    space,
     upper,
+    xdigit,
 };
 
 const ClassItemTag = enum { char, range, posix };
@@ -336,10 +342,16 @@ const Parser = struct {
                 self.index = end + 2;
                 if (std.mem.eql(u8, name, "alnum")) return .alnum;
                 if (std.mem.eql(u8, name, "alpha")) return .alpha;
+                if (std.mem.eql(u8, name, "blank")) return .blank;
+                if (std.mem.eql(u8, name, "cntrl")) return .cntrl;
                 if (std.mem.eql(u8, name, "digit")) return .digit;
-                if (std.mem.eql(u8, name, "space")) return .space;
+                if (std.mem.eql(u8, name, "graph")) return .graph;
                 if (std.mem.eql(u8, name, "lower")) return .lower;
+                if (std.mem.eql(u8, name, "print")) return .print;
+                if (std.mem.eql(u8, name, "punct")) return .punct;
+                if (std.mem.eql(u8, name, "space")) return .space;
                 if (std.mem.eql(u8, name, "upper")) return .upper;
+                if (std.mem.eql(u8, name, "xdigit")) return .xdigit;
                 return error.InvalidRegex;
             }
         }
@@ -511,10 +523,16 @@ fn matchesPosixClass(class: PosixClass, c: u8) bool {
     return switch (class) {
         .alnum => std.ascii.isAlphanumeric(c),
         .alpha => std.ascii.isAlphabetic(c),
+        .blank => c == ' ' or c == '\t',
+        .cntrl => std.ascii.isControl(c),
         .digit => std.ascii.isDigit(c),
-        .space => std.ascii.isWhitespace(c),
+        .graph => std.ascii.isGraphical(c),
         .lower => std.ascii.isLower(c),
+        .print => std.ascii.isPrint(c),
+        .punct => std.ascii.isPunctuation(c),
+        .space => std.ascii.isWhitespace(c),
         .upper => std.ascii.isUpper(c),
+        .xdigit => std.ascii.isHex(c),
     };
 }
 
