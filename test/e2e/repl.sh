@@ -577,8 +577,10 @@ t "tty: paste keeps newline" "3" "$out"
 out=$(pty 'garbage!!!\x037 * 6\r')
 t "tty: ctrl-c clears" "42" "$out"
 
-# Ctrl-D on an empty line exits without error output.
-out=$(( sleep 0.4; printf '\x04'; sleep 0.4 ) | script -qec "$FIX repl; echo exit=\$?" /dev/null 2>/dev/null)
+# Ctrl-D on an empty line exits without error output. `script -c` runs its
+# command under the login shell, which may not be POSIX (e.g. fish rejects
+# `$?`), so evaluate the exit status under an explicit `sh`.
+out=$(( sleep 0.4; printf '\x04'; sleep 0.4 ) | script -qec "sh -c '$FIX repl; echo exit=\$?'" /dev/null 2>/dev/null)
 t "tty: ctrl-d exits 0" "exit=0" "$out"
 
 # --no-tui retains the inline editor but prevents optional workspaces from
