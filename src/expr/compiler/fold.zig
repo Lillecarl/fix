@@ -297,7 +297,8 @@ fn tryFoldUnaryOp(self: *Compiler, op: ast.UnaryOp, expr: *const Node) anyerror!
                 if (i == std.math.minInt(i64)) break :blk null;
                 break :blk try int_ops.make(self.heap, -i);
             },
-            .float => Value.float(-v.asFloat()),
+            // Nix negates by subtraction (`0 - x`), so `-0.0` folds to `+0.0`.
+            .float => Value.float(0.0 - v.asFloat()),
             else => null,
         },
     };

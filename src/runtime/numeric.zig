@@ -99,7 +99,10 @@ pub fn negate(heap: *ObjectHeap, value: Value) !Value {
         // Nix's `0 - i64_min` behaviour.
         .int => int_mod.make(heap, try checkedSub(0, value.asInt())),
         .boxed_int => int_mod.make(heap, try checkedSub(0, try heap.getBoxedInt(value.asObjectId()))),
-        .float => Value.float(-value.asFloat()),
+        // Nix negates by subtraction (`0 - x`), so `-0.0` yields `+0.0`; a
+        // plain `-x` would keep the sign of zero. Identical for every other
+        // value, and consistent with the `int` branch below.
+        .float => Value.float(0.0 - value.asFloat()),
         else => error.TypeError,
     };
 }
