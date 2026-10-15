@@ -1129,10 +1129,12 @@ pub const Engine = struct {
     }
 
     fn copyDiagnostics(self: *Engine, diagnostics: []const Diagnostic, source: []const u8, source_path: ?[]const u8) !void {
+        if (vm_mod.context.suppress_compile_diagnostics) return;
         try self.report.replaceDiagnostics(diagnostics, source, source_path);
     }
 
     fn appendDiagnostics(self: *Engine, diagnostics: []const Diagnostic, source: []const u8, source_path: ?[]const u8) !void {
+        if (vm_mod.context.suppress_compile_diagnostics) return;
         try self.report.appendDiagnostics(diagnostics, source, source_path);
     }
 

@@ -1246,6 +1246,11 @@ fn runAttrsSweepTask(f: *WorkerFiber, attrs_id: types.ObjectId) void {
 fn runImportPrefetchTask(f: *WorkerFiber, path_id: types.InternId) void {
     const host = f.vm.import_host orelse return;
     const path = f.vm.intern.get(path_id);
+    // A prefetched `.nix` path constant is not necessarily an import (it may be
+    // coerced to a store path only), so its compile can legitimately fail; keep
+    // that failure out of the run's diagnostics.
+    vm_mod.suppress_compile_diagnostics = true;
+    defer vm_mod.suppress_compile_diagnostics = false;
     // Demand replays cached deterministic failures through the same registry.
     _ = host.import_value(host.context, &f.vm, path, 1) catch {};
     f.ctx.clearFailure();

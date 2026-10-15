@@ -47,6 +47,15 @@ const vma = @import("runtime").mem_tag.vma;
 const PatternCache = @import("../support.zig").regex.PatternCache;
 const FiberExecutor = @import("../eval/workers/port.zig").FiberExecutor;
 
+/// Set while a *speculative* import-prefetch compiles a file. The prefetch lane
+/// compiles every `.nix` path constant, including one that is only coerced to a
+/// store path and never imported — e.g. a `.nix` template with `@placeholders@`
+/// that a build substitutes. Such a compile legitimately fails to parse, and
+/// that failure must not reach the run's diagnostics (it is not a program the
+/// user asked to evaluate, and Nix never compiles it). Diagnostics are written
+/// from the compiling worker's own stack, so a thread-local flag is exact.
+pub threadlocal var suppress_compile_diagnostics: bool = false;
+
 pub const Driver = struct {
     eval: *const fn (*VM, ChunkId) anyerror!Value,
 };
