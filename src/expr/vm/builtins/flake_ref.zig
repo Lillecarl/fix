@@ -170,7 +170,21 @@ fn appendQueryAttrs(self: *VM, entries: *std.ArrayListUnmanaged(heap_mod.AttrEnt
         const separator = std.mem.indexOfScalar(u8, part, '=') orelse continue;
         const key = part[0..separator];
         const value = part[separator + 1 ..];
-        inline for (.{ "ref", "rev", "narHash", "dir", "host", "submodules", "shallow", "lastModified", "revCount" }) |known| {
+        // Nix types the git flags as booleans: `?shallow=1` and `?submodules=1`
+        // parse to `true`, and every other spelling to `false`. `fetchTree`
+        // reads them with a bool-typed attribute lookup, so leaving them as
+        // strings made a `?shallow=1` flakeref a type error rather than a
+        // shallow fetch.
+        inline for (.{ "shallow", "submodules" }) |known| {
+            if (std.mem.eql(u8, key, known)) {
+                try entries.append(self.allocator, .{
+                    .name = try self.intern.intern(key),
+                    .value = Value.boolVal(std.mem.eql(u8, value, "1")),
+                });
+                break;
+            }
+        }
+        inline for (.{ "ref", "rev", "narHash", "dir", "host", "lastModified", "revCount" }) |known| {
             if (std.mem.eql(u8, key, known)) {
                 try appendStringAttr(self, entries, key, value);
                 break;
