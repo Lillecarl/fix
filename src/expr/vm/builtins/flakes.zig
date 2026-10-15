@@ -107,6 +107,16 @@ fn fetchTreeImpl(self: *VM, arg: Value, fetch_tree_defaults: bool) !Value {
     }
     if (!attrs.isAttrs()) return error.TypeError;
 
+    // Nix resolves a locked `narHash` to its store path without fetching, for
+    // every input type (fetchers.cc `isFinal()`), so an input already in the
+    // store is served from there. `builtins.fetchTree` must do the same, not
+    // only the flake-lock resolver: flake-compatish drives every input through
+    // `builtins.fetchTree`, so without this a locked git input whose rev the
+    // transport cannot fetch (e.g. an ancestor GitHub no longer advertises)
+    // fails even though the tree Nix cached is valid. Fail-open — any miss
+    // (no narHash, unsupported type, path not valid) falls through to a fetch.
+    if (try flakeInputFromStore(self, attrs)) |adopted| return adopted;
+
     // GC: `attrs` is held (via `attrs_id`) across the force-walking spec
     // helpers below. On the recursive path (`builtinParseFlakeRef` result) it
     // is a freshly built attrset that isn't the auto-rooted builtin argument.
